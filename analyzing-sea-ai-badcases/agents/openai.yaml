@@ -1,0 +1,4 @@
+interface:
+  display_name: "sea.AI Badcase 排查"
+  short_description: "分析 sea.AI 调试记录并定位对应配置优化动作"
+  default_prompt: "使用 $analyzing-sea-ai-badcases 分析这条 sea.AI Badcase 调试记录。"
