@@ -89,9 +89,12 @@ Uninstalling must not delete Feishu events that were already created.
 
 ## Architecture
 
-The repository will contain:
+The source of record is the `Tsytt/Waterdrop` repository whose `origin` is
+`https://github.com/Tsytt/Waterdrop.git`. Add the Skill as a top-level repository
+directory and update the root Skill index:
 
 ```text
+README.md                         # add the new Skill to the repository index
 booking-waterdrop-rooms/
 ├── SKILL.md
 ├── agents/openai.yaml
