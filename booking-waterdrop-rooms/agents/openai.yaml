@@ -1,0 +1,4 @@
+interface:
+  display_name: "Book Waterdrop Rooms"
+  short_description: "Schedule two Waterdrop room reservations"
+  default_prompt: "Use $booking-waterdrop-rooms to schedule tomorrow's 09:00 booking for two non-overlapping Waterdrop Building meeting-room time slots."
