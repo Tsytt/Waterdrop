@@ -22,6 +22,8 @@ import manage_booking as manage
 TZ = ZoneInfo("Asia/Shanghai")
 BUILDING = "水滴大厦"
 PREFERRED_NAMES = {"7F-703", "7F-704"}
+BUILDING_PREFIX_RE = re.compile(rf"^{re.escape(BUILDING)}(?:-|$)")
+ROOM_BUILDING_RE = re.compile(r"^([^-]*大厦)(?:-|$)")
 FLOOR_RE = re.compile(
     r"(?:^|[-\s])(\d{1,2})F(?:[-\s]|$)", re.IGNORECASE
 )
@@ -82,12 +84,23 @@ def collect_room_records(payload: object) -> list[dict]:
 
 
 def _building_value(record: dict) -> str | None:
+    has_authoritative_value = False
     for key in ("building_name", "building", "building_display_name"):
-        value = record.get(key)
-        if isinstance(value, str) and value:
-            return value
+        if key not in record or record[key] in (None, ""):
+            continue
+        has_authoritative_value = True
+        if not isinstance(record[key], str) or record[key] != BUILDING:
+            return None
+
     room_name = str(record.get("room_name", ""))
-    if BUILDING in room_name:
+    name_building = ROOM_BUILDING_RE.match(room_name)
+    if (
+        has_authoritative_value
+        and name_building
+        and name_building.group(1) != BUILDING
+    ):
+        return None
+    if has_authoritative_value or BUILDING_PREFIX_RE.match(room_name):
         return BUILDING
     return None
 
@@ -175,11 +188,15 @@ class LarkClient:
             payload = json.loads(text)
         except json.JSONDecodeError as exc:
             raise LarkError("lark-cli returned non-JSON output") from exc
+        if not isinstance(payload, dict):
+            raise LarkError("lark-cli returned a non-object JSON envelope")
         if (
             isinstance(payload.get("_notice"), dict)
             and payload["_notice"].get("update")
         ):
             self.update_notice = True
+        if "error" in payload and not isinstance(payload["error"], dict):
+            raise LarkError("lark-cli returned a malformed error envelope")
         if result.returncode != 0 or payload.get("ok") is not True:
             error = payload.get("error", {})
             message = str(error.get("message") or "lark-cli command failed")
@@ -207,7 +224,7 @@ class LarkClient:
         data = payload.get("data", payload)
         identity = data.get("identity") or payload.get("identity")
         verified = data.get("verified")
-        if identity not in (None, "user") or verified is False:
+        if identity != "user" or verified is not True:
             raise LarkError("Feishu user login is not verified")
 
     def room_find(self, start_iso: str, end_iso: str) -> list[Room]:
@@ -238,6 +255,8 @@ class LarkClient:
         end_iso: str,
         room_id: str,
     ) -> str:
+        if not isinstance(room_id, str) or not room_id.startswith("omm_"):
+            raise LarkError("invalid Feishu room resource id")
         payload = self._json(
             [
                 "calendar",

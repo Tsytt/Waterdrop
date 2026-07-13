@@ -691,6 +691,39 @@ class RoomRankingTests(unittest.TestCase):
         record = {"room_id": "omm_unknown", "room_name": "7F-703"}
         self.assertIsNone(runner.normalize_room(record))
 
+    def test_rejects_building_name_substring_fallback(self):
+        record = {
+            "room_id": "omm_imposter",
+            "room_name": "非水滴大厦-7F-703",
+        }
+        self.assertIsNone(runner.normalize_room(record))
+
+    def test_rejects_conflicting_building_metadata_and_room_name(self):
+        record = {
+            "room_id": "omm_conflict",
+            "room_name": "铭丰大厦-7F-703",
+            "building_name": "水滴大厦",
+        }
+        self.assertIsNone(runner.normalize_room(record))
+
+    def test_rejects_conflicting_authoritative_building_fields(self):
+        record = {
+            "room_id": "omm_conflict",
+            "room_name": "水滴大厦-7F-703",
+            "building_name": "水滴大厦",
+            "building_display_name": "铭丰大厦",
+        }
+        self.assertIsNone(runner.normalize_room(record))
+
+    def test_accepts_anchored_building_name_fallback(self):
+        record = {
+            "room_id": "omm_fallback",
+            "room_name": "水滴大厦-7F-703",
+        }
+        room = runner.normalize_room(record)
+        self.assertIsNotNone(room)
+        self.assertEqual(room.building, "水滴大厦")
+
     def test_rejects_non_resource_id(self):
         record = {
             "room_id": "703",
@@ -701,6 +734,100 @@ class RoomRankingTests(unittest.TestCase):
 
 
 class LarkCommandTests(unittest.TestCase):
+    def test_rejects_non_object_json_envelope_as_fatal(self):
+        client = runner.LarkClient(
+            Path("lark-cli"),
+            lambda argv, **kwargs: mock.Mock(
+                returncode=0,
+                stdout=json.dumps([]),
+                stderr="",
+            ),
+        )
+
+        with self.assertRaises(runner.LarkError) as caught:
+            client.room_find(
+                "2026-07-16T10:00:00+08:00",
+                "2026-07-16T11:00:00+08:00",
+            )
+        self.assertEqual(caught.exception.kind, "fatal")
+
+    def test_rejects_non_object_error_envelope_as_fatal(self):
+        client = runner.LarkClient(
+            Path("lark-cli"),
+            lambda argv, **kwargs: mock.Mock(
+                returncode=1,
+                stdout="",
+                stderr=json.dumps(
+                    {
+                        "ok": False,
+                        "identity": "user",
+                        "error": "malformed",
+                    }
+                ),
+            ),
+        )
+
+        with self.assertRaises(runner.LarkError) as caught:
+            client.room_find(
+                "2026-07-16T10:00:00+08:00",
+                "2026-07-16T11:00:00+08:00",
+            )
+        self.assertEqual(caught.exception.kind, "fatal")
+
+    def test_auth_status_requires_explicit_verified_user_identity(self):
+        invalid_payloads = {
+            "missing identity": {
+                "ok": True,
+                "data": {"verified": True},
+            },
+            "missing verified": {
+                "ok": True,
+                "identity": "user",
+                "data": {"identity": "user"},
+            },
+            "bot identity": {
+                "ok": True,
+                "identity": "bot",
+                "data": {"identity": "bot", "verified": True},
+            },
+            "verification failed": {
+                "ok": True,
+                "identity": "user",
+                "data": {"identity": "user", "verified": False},
+            },
+        }
+
+        for case, payload in invalid_payloads.items():
+            with self.subTest(case=case):
+                client = runner.LarkClient(
+                    Path("lark-cli"),
+                    lambda argv, payload=payload, **kwargs: mock.Mock(
+                        returncode=0,
+                        stdout=json.dumps(payload),
+                        stderr="",
+                    ),
+                )
+                with self.assertRaises(runner.LarkError) as caught:
+                    client.auth_status()
+                self.assertEqual(caught.exception.kind, "fatal")
+
+    def test_auth_status_accepts_explicit_verified_user_identity(self):
+        payload = {
+            "ok": True,
+            "identity": "user",
+            "data": {"identity": "user", "verified": True},
+        }
+        client = runner.LarkClient(
+            Path("lark-cli"),
+            lambda argv, **kwargs: mock.Mock(
+                returncode=0,
+                stdout=json.dumps(payload),
+                stderr="",
+            ),
+        )
+
+        self.assertIsNone(client.auth_status())
+
     def test_room_find_uses_user_identity_and_waterdrop_filter(self):
         calls = []
 
@@ -760,6 +887,35 @@ class LarkCommandTests(unittest.TestCase):
             calls[0][calls[0].index("--attendee-ids") + 1],
             "omm_704",
         )
+
+    def test_create_rejects_invalid_room_ids_before_runner(self):
+        for room_id in ("", "ou_person"):
+            with self.subTest(room_id=room_id):
+                calls = []
+
+                def fake_run(argv, **kwargs):
+                    calls.append(argv)
+                    return mock.Mock(
+                        returncode=0,
+                        stdout=json.dumps(
+                            {
+                                "ok": True,
+                                "identity": "user",
+                                "data": {"event_id": "evt_1"},
+                            }
+                        ),
+                        stderr="",
+                    )
+
+                client = runner.LarkClient(Path("lark-cli"), fake_run)
+                with self.assertRaises(runner.LarkError) as caught:
+                    client.create_event(
+                        "2026-07-16T10:00:00+08:00",
+                        "2026-07-16T11:00:00+08:00",
+                        room_id,
+                    )
+                self.assertEqual(caught.exception.kind, "fatal")
+                self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":
