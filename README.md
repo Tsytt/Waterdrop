@@ -4,7 +4,7 @@ A collection of Codex skills for Waterdrop business workflows. Each top-level di
 
 ## Skills
 
-- `analyzing-sea-ai-badcases`: Analyzes sea.AI robot bad cases, maps trace evidence to application-, sub-agent-, and expert-level configuration, and produces optimization recommendations in a fixed report format.
+- `analyzing-sea-ai-badcases`: Analyzes sea.AI robot bad cases by comparing the expected business handling route with the actual trace, validating whether the matched intent or Agent is the correct receiver, mapping evidence to application-, sub-agent-, and expert-level configuration, and producing prioritized recommendations in a fixed report format.
 
 ## Installation
 
