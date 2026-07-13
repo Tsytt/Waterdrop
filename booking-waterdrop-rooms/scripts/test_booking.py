@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import plistlib
+import stat
 import sys
 import tempfile
 import unittest
@@ -115,6 +116,27 @@ class SchedulerTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def launchctl_call(self, action):
+        return (
+            [
+                "launchctl",
+                action,
+                manage._launch_domain(),
+                str(self.plist_path),
+            ],
+            {"text": True, "capture_output": True},
+        )
+
+    def assert_no_install_artifacts(self):
+        self.assertFalse((self.state_dir / "runtime").exists())
+        self.assertFalse(self.plist_path.exists())
+        self.assertEqual(list(self.state_dir.glob(".runtime.*")), [])
+        if self.plist_path.parent.exists():
+            self.assertEqual(
+                list(self.plist_path.parent.glob(f".{self.plist_path.name}.*")),
+                [],
+            )
+
     def test_launch_agent_runs_daily_at_0859(self):
         payload = manage.build_launch_agent(
             Path("/usr/bin/python3"),
@@ -134,7 +156,7 @@ class SchedulerTests(unittest.TestCase):
         calls = []
 
         def fake_run(argv, **kwargs):
-            calls.append(argv)
+            calls.append((argv, kwargs))
             return mock.Mock(returncode=0, stdout="", stderr="")
 
         result = manage.install_scheduler(
@@ -146,11 +168,171 @@ class SchedulerTests(unittest.TestCase):
             fake_run,
         )
         self.assertEqual(result["status"], "installed")
-        self.assertTrue((self.state_dir / "runtime" / "run_booking.py").exists())
+        runtime_dir = self.state_dir / "runtime"
+        manager = runtime_dir / "manage_booking.py"
+        runner = runtime_dir / "run_booking.py"
+        self.assertEqual(manager.read_text(), "# manager\n")
+        self.assertEqual(runner.read_text(), "# runner\n")
         with self.plist_path.open("rb") as handle:
             plist = plistlib.load(handle)
         self.assertEqual(plist["StartCalendarInterval"]["Minute"], 59)
-        self.assertTrue(any("bootstrap" in call for call in calls))
+        self.assertEqual(
+            stat.S_IMODE(self.state_dir.stat().st_mode),
+            0o700,
+        )
+        self.assertEqual(stat.S_IMODE(runtime_dir.stat().st_mode), 0o700)
+        self.assertEqual(
+            stat.S_IMODE((self.state_dir / "logs").stat().st_mode),
+            0o700,
+        )
+        self.assertEqual(stat.S_IMODE(manager.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(runner.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(self.plist_path.stat().st_mode), 0o600)
+        self.assertEqual(
+            calls,
+            [
+                self.launchctl_call("bootout"),
+                self.launchctl_call("bootstrap"),
+            ],
+        )
+
+    def test_missing_runner_leaves_no_partial_install(self):
+        (self.source_dir / "run_booking.py").unlink()
+        calls = []
+
+        with self.assertRaises(FileNotFoundError):
+            manage.install_scheduler(
+                self.source_dir,
+                self.state_dir,
+                self.plist_path,
+                Path("/usr/bin/python3"),
+                Path("/opt/homebrew/bin/lark-cli"),
+                lambda argv, **kwargs: calls.append((argv, kwargs)),
+            )
+
+        self.assertEqual(calls, [])
+        self.assert_no_install_artifacts()
+
+    def test_copy_failure_leaves_no_partial_install(self):
+        calls = []
+        real_copy = manage.shutil.copy2
+
+        def fail_runner_copy(source, destination):
+            if Path(source).name == "run_booking.py":
+                raise OSError("copy failed")
+            return real_copy(source, destination)
+
+        with mock.patch.object(
+            manage.shutil,
+            "copy2",
+            side_effect=fail_runner_copy,
+        ):
+            with self.assertRaisesRegex(OSError, "copy failed"):
+                manage.install_scheduler(
+                    self.source_dir,
+                    self.state_dir,
+                    self.plist_path,
+                    Path("/usr/bin/python3"),
+                    Path("/opt/homebrew/bin/lark-cli"),
+                    lambda argv, **kwargs: calls.append((argv, kwargs)),
+                )
+
+        self.assertEqual(calls, [])
+        self.assert_no_install_artifacts()
+
+    def test_bootstrap_failure_removes_new_install(self):
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            if argv[1] == "bootstrap":
+                return mock.Mock(
+                    returncode=5,
+                    stdout="",
+                    stderr="Input/output error",
+                )
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with self.assertRaisesRegex(RuntimeError, "bootstrap failed"):
+            manage.install_scheduler(
+                self.source_dir,
+                self.state_dir,
+                self.plist_path,
+                Path("/usr/bin/python3"),
+                Path("/opt/homebrew/bin/lark-cli"),
+                fake_run,
+            )
+
+        self.assertEqual(
+            calls,
+            [
+                self.launchctl_call("bootout"),
+                self.launchctl_call("bootstrap"),
+                self.launchctl_call("bootout"),
+            ],
+        )
+        self.assert_no_install_artifacts()
+
+    def test_failed_reinstall_restores_and_reloads_old_version(self):
+        runtime_dir = self.state_dir / "runtime"
+        runtime_dir.mkdir(parents=True)
+        (runtime_dir / "manage_booking.py").write_text("old manager\n")
+        (runtime_dir / "run_booking.py").write_text("old runner\n")
+        old_plist = {
+            "Label": manage.LABEL,
+            "ProgramArguments": ["/old/python", "/old/runner"],
+        }
+        manage._write_plist(self.plist_path, old_plist)
+        old_plist_bytes = self.plist_path.read_bytes()
+        calls = []
+        bootstrap_count = 0
+
+        def fake_run(argv, **kwargs):
+            nonlocal bootstrap_count
+            calls.append((argv, kwargs))
+            if argv[1] == "bootstrap":
+                bootstrap_count += 1
+                if bootstrap_count == 1:
+                    return mock.Mock(
+                        returncode=5,
+                        stdout="",
+                        stderr="new version failed",
+                    )
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with self.assertRaisesRegex(RuntimeError, "bootstrap failed"):
+            manage.install_scheduler(
+                self.source_dir,
+                self.state_dir,
+                self.plist_path,
+                Path("/usr/bin/python3"),
+                Path("/opt/homebrew/bin/lark-cli"),
+                fake_run,
+            )
+
+        self.assertEqual(
+            (runtime_dir / "manage_booking.py").read_text(),
+            "old manager\n",
+        )
+        self.assertEqual(
+            (runtime_dir / "run_booking.py").read_text(),
+            "old runner\n",
+        )
+        self.assertEqual(self.plist_path.read_bytes(), old_plist_bytes)
+        self.assertEqual(
+            calls,
+            [
+                self.launchctl_call("bootout"),
+                self.launchctl_call("bootstrap"),
+                self.launchctl_call("bootout"),
+                self.launchctl_call("bootstrap"),
+            ],
+        )
+        self.assertEqual(list(self.state_dir.glob(".runtime.*")), [])
+        self.assertEqual(
+            list(self.plist_path.parent.glob(f".{self.plist_path.name}.*")),
+            [],
+        )
 
     def test_uninstall_preserves_history(self):
         (self.state_dir / "history").mkdir(parents=True)
@@ -165,13 +347,55 @@ class SchedulerTests(unittest.TestCase):
             self.state_dir,
             self.plist_path,
             lambda argv, **kwargs: mock.Mock(
-                returncode=0, stdout="", stderr=""
+                returncode=3,
+                stdout="",
+                stderr="Boot-out failed: 3: No such process",
             ),
         )
         self.assertEqual(result["status"], "uninstalled")
         self.assertTrue((self.state_dir / "history" / "result.json").exists())
         self.assertIsNone(manage.load_pending_update(self.state_dir))
         self.assertFalse(self.plist_path.exists())
+
+    def test_uninstall_bootout_failure_preserves_all_state(self):
+        runtime_dir = self.state_dir / "runtime"
+        runtime_dir.mkdir(parents=True)
+        (runtime_dir / "run_booking.py").write_text("runner\n")
+        manage._atomic_write_json(
+            manage.plan_path(self.state_dir),
+            {"status": "pending"},
+        )
+        manage._atomic_write_json(
+            manage.update_state_path(self.state_dir),
+            {"status": "needs_approval"},
+        )
+        self.plist_path.parent.mkdir(parents=True)
+        self.plist_path.write_text("plist")
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return mock.Mock(
+                returncode=5,
+                stdout="",
+                stderr="Boot-out failed: 5: Input/output error",
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "bootout failed"):
+            manage.uninstall_scheduler(
+                self.state_dir,
+                self.plist_path,
+                fake_run,
+            )
+
+        self.assertEqual(calls, [self.launchctl_call("bootout")])
+        self.assertTrue(self.plist_path.exists())
+        self.assertTrue(manage.plan_path(self.state_dir).exists())
+        self.assertTrue(manage.update_state_path(self.state_dir).exists())
+        self.assertEqual(
+            (runtime_dir / "run_booking.py").read_text(),
+            "runner\n",
+        )
 
     def test_management_cli_exposes_required_commands(self):
         parser = manage.build_parser()

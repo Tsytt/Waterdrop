@@ -257,6 +257,68 @@ def _launch_domain() -> str:
     return f"gui/{os.getuid()}"
 
 
+def _launchctl(
+    action: str,
+    plist_path: Path,
+    run_command: RunCommand,
+) -> object:
+    return run_command(
+        ["launchctl", action, _launch_domain(), str(plist_path)],
+        text=True,
+        capture_output=True,
+    )
+
+
+def _launchctl_error(result: object) -> str:
+    stderr = str(getattr(result, "stderr", "") or "").strip()
+    stdout = str(getattr(result, "stdout", "") or "").strip()
+    return stderr or stdout or f"exit status {getattr(result, 'returncode', 1)}"
+
+
+def _service_is_missing(result: object) -> bool:
+    output = " ".join(
+        str(getattr(result, name, "") or "")
+        for name in ("stdout", "stderr")
+    ).lower()
+    return any(
+        marker in output
+        for marker in (
+            "no such process",
+            "could not find specified service",
+            "could not find service",
+            "service not found",
+            "service is not loaded",
+            "not loaded",
+        )
+    )
+
+
+def _bootout(plist_path: Path, run_command: RunCommand) -> object:
+    result = _launchctl("bootout", plist_path, run_command)
+    if getattr(result, "returncode", 1) != 0 and not _service_is_missing(result):
+        raise RuntimeError(f"launchctl bootout failed: {_launchctl_error(result)}")
+    return result
+
+
+def _bootstrap(plist_path: Path, run_command: RunCommand) -> None:
+    result = _launchctl("bootstrap", plist_path, run_command)
+    if getattr(result, "returncode", 1) != 0:
+        raise RuntimeError(f"launchctl bootstrap failed: {_launchctl_error(result)}")
+
+
+def _path_exists(path: Path) -> bool:
+    return os.path.lexists(path)
+
+
+def _remove_path(path: Path) -> None:
+    if not _path_exists(path):
+        return
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
 def install_scheduler(
     source_dir: Path,
     state_dir: Path,
@@ -265,35 +327,81 @@ def install_scheduler(
     lark_bin: Path,
     run_command: RunCommand = subprocess.run,
 ) -> dict:
+    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(state_dir, 0o700)
     runtime_dir = state_dir / "runtime"
     log_dir = state_dir / "logs"
-    runtime_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(runtime_dir, 0o700)
     os.chmod(log_dir, 0o700)
-    for name in ("manage_booking.py", "run_booking.py"):
-        shutil.copy2(source_dir / name, runtime_dir / name)
-        os.chmod(runtime_dir / name, 0o700)
-    payload = build_launch_agent(
-        python_bin,
-        runtime_dir / "run_booking.py",
-        state_dir,
-        lark_bin,
-    )
-    _write_plist(plist_path, payload)
-    run_command(
-        ["launchctl", "bootout", _launch_domain(), str(plist_path)],
-        text=True,
-        capture_output=True,
-    )
-    result = run_command(
-        ["launchctl", "bootstrap", _launch_domain(), str(plist_path)],
-        text=True,
-        capture_output=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"launchctl bootstrap failed: {result.stderr.strip()}")
-    return {"status": "installed", "plist": str(plist_path)}
+
+    token = uuid.uuid4().hex
+    staged_runtime = state_dir / f".runtime.{token}.new"
+    backup_runtime = state_dir / f".runtime.{token}.backup"
+    staged_plist = plist_path.parent / f".{plist_path.name}.{token}.new"
+    backup_plist = plist_path.parent / f".{plist_path.name}.{token}.backup"
+    staged_runtime.mkdir(mode=0o700)
+    os.chmod(staged_runtime, 0o700)
+    try:
+        for name in ("manage_booking.py", "run_booking.py"):
+            shutil.copy2(source_dir / name, staged_runtime / name)
+            os.chmod(staged_runtime / name, 0o700)
+        payload = build_launch_agent(
+            python_bin,
+            runtime_dir / "run_booking.py",
+            state_dir,
+            lark_bin,
+        )
+        _write_plist(staged_plist, payload)
+    except Exception:
+        _remove_path(staged_runtime)
+        _remove_path(staged_plist)
+        raise
+
+    old_runtime = _path_exists(runtime_dir)
+    old_plist = _path_exists(plist_path)
+    new_runtime_installed = False
+    new_plist_installed = False
+    old_agent_was_loaded = False
+    try:
+        bootout_result = _bootout(plist_path, run_command)
+        old_agent_was_loaded = getattr(bootout_result, "returncode", 1) == 0
+        if old_runtime:
+            os.replace(runtime_dir, backup_runtime)
+        if old_plist:
+            os.replace(plist_path, backup_plist)
+        os.replace(staged_runtime, runtime_dir)
+        new_runtime_installed = True
+        os.replace(staged_plist, plist_path)
+        new_plist_installed = True
+        _bootstrap(plist_path, run_command)
+    except Exception as install_error:
+        if new_plist_installed:
+            try:
+                _launchctl("bootout", plist_path, run_command)
+            except Exception:
+                pass
+            _remove_path(plist_path)
+        if new_runtime_installed:
+            _remove_path(runtime_dir)
+        if old_runtime and _path_exists(backup_runtime):
+            os.replace(backup_runtime, runtime_dir)
+        if old_plist and _path_exists(backup_plist):
+            os.replace(backup_plist, plist_path)
+        if old_agent_was_loaded and old_plist:
+            try:
+                _bootstrap(plist_path, run_command)
+            except Exception as restore_error:
+                raise RuntimeError(
+                    f"{install_error}; previous agent restore failed: {restore_error}"
+                ) from install_error
+        raise
+    else:
+        _remove_path(backup_runtime)
+        _remove_path(backup_plist)
+        return {"status": "installed", "plist": str(plist_path)}
+    finally:
+        _remove_path(staged_runtime)
+        _remove_path(staged_plist)
 
 
 def uninstall_scheduler(
@@ -301,11 +409,7 @@ def uninstall_scheduler(
     plist_path: Path,
     run_command: RunCommand = subprocess.run,
 ) -> dict:
-    run_command(
-        ["launchctl", "bootout", _launch_domain(), str(plist_path)],
-        text=True,
-        capture_output=True,
-    )
+    _bootout(plist_path, run_command)
     plist_path.unlink(missing_ok=True)
     plan_path(state_dir).unlink(missing_ok=True)
     update_state_path(state_dir).unlink(missing_ok=True)
