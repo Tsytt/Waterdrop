@@ -592,5 +592,175 @@ class SchedulerTests(unittest.TestCase):
         )
 
 
+import run_booking as runner
+
+
+class RoomRankingTests(unittest.TestCase):
+    def test_collects_nested_room_records_in_api_order(self):
+        payload = {
+            "ok": True,
+            "data": {
+                "rooms": [
+                    {
+                        "room_id": "omm_704",
+                        "room_name": "水滴大厦-7F-704",
+                        "building_name": "水滴大厦",
+                        "floor_name": "7F",
+                    },
+                    {
+                        "room_id": "omm_603",
+                        "room_name": "水滴大厦-6F-603",
+                        "building_name": "水滴大厦",
+                        "floor_name": "6F",
+                    },
+                ]
+            },
+        }
+        records = runner.collect_room_records(payload)
+        self.assertEqual(
+            [item["room_id"] for item in records],
+            ["omm_704", "omm_603"],
+        )
+
+    def test_ranks_waterdrop_rooms_and_rejects_other_buildings(self):
+        records = [
+            {
+                "room_id": "omm_other",
+                "room_name": "铭丰大厦-7F-703",
+                "building_name": "铭丰大厦",
+                "floor_name": "7F",
+            },
+            {
+                "room_id": "omm_six",
+                "room_name": "水滴大厦-6F-601",
+                "building_name": "水滴大厦",
+                "floor_name": "6F",
+            },
+            {
+                "room_id": "omm_seven",
+                "room_name": "水滴大厦-7F-705",
+                "building_name": "水滴大厦",
+                "floor_name": "7F",
+            },
+            {
+                "room_id": "omm_preferred",
+                "room_name": "水滴大厦-7F-704",
+                "building_name": "水滴大厦",
+                "floor_name": "7F",
+            },
+            {
+                "room_id": "omm_other_floor",
+                "room_name": "水滴大厦-5F-501",
+                "building_name": "水滴大厦",
+                "floor_name": "5F",
+            },
+        ]
+        rooms = [
+            room
+            for record in records
+            if (room := runner.normalize_room(record))
+        ]
+        ranked = runner.rank_rooms(rooms)
+        self.assertEqual(
+            [room.room_id for room in ranked],
+            ["omm_preferred", "omm_seven", "omm_six", "omm_other_floor"],
+        )
+
+    def test_703_and_704_preserve_api_order(self):
+        records = [
+            {
+                "room_id": "omm_704",
+                "room_name": "水滴大厦-7F-704",
+                "building_name": "水滴大厦",
+                "floor_name": "7F",
+            },
+            {
+                "room_id": "omm_703",
+                "room_name": "水滴大厦-7F-703",
+                "building_name": "水滴大厦",
+                "floor_name": "7F",
+            },
+        ]
+        rooms = [runner.normalize_room(record) for record in records]
+        self.assertEqual(
+            [room.room_id for room in runner.rank_rooms(rooms)],
+            ["omm_704", "omm_703"],
+        )
+
+    def test_rejects_record_that_cannot_prove_building(self):
+        record = {"room_id": "omm_unknown", "room_name": "7F-703"}
+        self.assertIsNone(runner.normalize_room(record))
+
+    def test_rejects_non_resource_id(self):
+        record = {
+            "room_id": "703",
+            "room_name": "水滴大厦-7F-703",
+            "building_name": "水滴大厦",
+        }
+        self.assertIsNone(runner.normalize_room(record))
+
+
+class LarkCommandTests(unittest.TestCase):
+    def test_room_find_uses_user_identity_and_waterdrop_filter(self):
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "ok": True,
+                        "identity": "user",
+                        "data": {"rooms": []},
+                    }
+                ),
+                stderr="",
+            )
+
+        client = runner.LarkClient(
+            Path("/opt/homebrew/bin/lark-cli"), fake_run
+        )
+        client.room_find(
+            "2026-07-16T10:00:00+08:00",
+            "2026-07-16T11:00:00+08:00",
+        )
+        command = calls[0]
+        self.assertIn("--as", command)
+        self.assertIn("user", command)
+        self.assertIn("--building", command)
+        self.assertIn("水滴大厦", command)
+
+    def test_create_omits_summary_and_adds_only_room(self):
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "ok": True,
+                        "identity": "user",
+                        "data": {"event_id": "evt_1"},
+                    }
+                ),
+                stderr="",
+            )
+
+        client = runner.LarkClient(Path("lark-cli"), fake_run)
+        event_id = client.create_event(
+            "2026-07-16T10:00:00+08:00",
+            "2026-07-16T11:00:00+08:00",
+            "omm_704",
+        )
+        self.assertEqual(event_id, "evt_1")
+        self.assertNotIn("--summary", calls[0])
+        self.assertEqual(
+            calls[0][calls[0].index("--attendee-ids") + 1],
+            "omm_704",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
