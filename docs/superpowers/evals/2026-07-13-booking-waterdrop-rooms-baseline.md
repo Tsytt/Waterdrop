@@ -3,6 +3,7 @@
 ## Environment
 
 - Date: 2026-07-13
+- Controls executed: 2026-07-14 (Scenario 1 resolved relative dates from this actual control execution date.)
 - New Skill present: no
 - External writes allowed: no
 
@@ -32,7 +33,7 @@ Raw response:
 
 Observed failures:
 
-- None demonstrated for overlap handling: the response identifies the overlap and does not proceed with writes.
+- Identifies the overlap but does not reject it: the response still asks whether both overlapping ranges should be booked and says it will create events after confirmation.
 
 ### Scenario 3: Building boundary
 
@@ -76,6 +77,7 @@ Observed failures:
 ## Failure Patterns the Skill Must Correct
 
 - Preview the normalized plan and obtain explicit confirmation that preauthorizes both future Feishu event writes before persisting it.
+- Reject any overlapping ranges before saving a plan or performing any write; confirmation must not override this validation.
 - Create untitled events and communicate the Mac-awake-and-online requirement.
 - Reject every room outside 水滴大厦 and do not add capacity or equipment filters.
 - Treat a duplicate request as replacement of a pending plan: show old and new ranges, reconfirm, and persist the replacement atomically.
