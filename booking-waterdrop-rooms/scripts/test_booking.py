@@ -273,6 +273,71 @@ class SchedulerTests(unittest.TestCase):
         )
         self.assert_no_install_artifacts()
 
+    def test_cleanup_bootout_failure_preserves_new_install_for_recovery(self):
+        calls = []
+        bootout_count = 0
+
+        def fake_run(argv, **kwargs):
+            nonlocal bootout_count
+            calls.append((argv, kwargs))
+            if argv[1] == "bootstrap":
+                return mock.Mock(
+                    returncode=5,
+                    stdout="",
+                    stderr="new bootstrap failed",
+                )
+            bootout_count += 1
+            if bootout_count == 2:
+                return mock.Mock(
+                    returncode=5,
+                    stdout="",
+                    stderr="cleanup permission denied",
+                )
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with self.assertRaises(RuntimeError) as caught:
+            manage.install_scheduler(
+                self.source_dir,
+                self.state_dir,
+                self.plist_path,
+                Path("/usr/bin/python3"),
+                Path("/opt/homebrew/bin/lark-cli"),
+                fake_run,
+            )
+
+        message = str(caught.exception)
+        self.assertIn("bootstrap failed", message)
+        self.assertIn("cleanup bootout failed", message)
+        self.assertIn("cleanup permission denied", message)
+        runtime_dir = self.state_dir / "runtime"
+        self.assertEqual(
+            (runtime_dir / "manage_booking.py").read_text(),
+            "# manager\n",
+        )
+        self.assertEqual(
+            (runtime_dir / "run_booking.py").read_text(),
+            "# runner\n",
+        )
+        self.assertTrue(self.plist_path.exists())
+        self.assertEqual(list(self.state_dir.glob(".runtime.*.backup")), [])
+        self.assertEqual(list(self.state_dir.glob(".runtime.*.new")), [])
+        self.assertEqual(
+            list(self.plist_path.parent.glob(f".{self.plist_path.name}.*.backup")),
+            [],
+        )
+        self.assertEqual(
+            list(self.plist_path.parent.glob(f".{self.plist_path.name}.*.new")),
+            [],
+        )
+        self.assertEqual(
+            calls,
+            [
+                self.launchctl_call("bootout"),
+                self.launchctl_call("bootstrap"),
+                self.launchctl_call("bootout"),
+            ],
+        )
+
     def test_failed_reinstall_restores_and_reloads_old_version(self):
         runtime_dir = self.state_dir / "runtime"
         runtime_dir.mkdir(parents=True)
@@ -332,6 +397,100 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(
             list(self.plist_path.parent.glob(f".{self.plist_path.name}.*")),
             [],
+        )
+
+    def test_cleanup_bootout_failure_preserves_old_backups_without_reload(self):
+        runtime_dir = self.state_dir / "runtime"
+        runtime_dir.mkdir(parents=True)
+        (runtime_dir / "manage_booking.py").write_text("old manager\n")
+        (runtime_dir / "run_booking.py").write_text("old runner\n")
+        old_plist = {
+            "Label": manage.LABEL,
+            "ProgramArguments": ["/old/python", "/old/runner"],
+        }
+        manage._write_plist(self.plist_path, old_plist)
+        old_plist_bytes = self.plist_path.read_bytes()
+        calls = []
+        bootout_count = 0
+        bootstrap_count = 0
+
+        def fake_run(argv, **kwargs):
+            nonlocal bootout_count, bootstrap_count
+            calls.append((argv, kwargs))
+            if argv[1] == "bootstrap":
+                bootstrap_count += 1
+                if bootstrap_count == 1:
+                    return mock.Mock(
+                        returncode=5,
+                        stdout="",
+                        stderr="new bootstrap failed",
+                    )
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            bootout_count += 1
+            if bootout_count == 2:
+                return mock.Mock(
+                    returncode=5,
+                    stdout="",
+                    stderr="cleanup input/output error",
+                )
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with self.assertRaises(RuntimeError) as caught:
+            manage.install_scheduler(
+                self.source_dir,
+                self.state_dir,
+                self.plist_path,
+                Path("/usr/bin/python3"),
+                Path("/opt/homebrew/bin/lark-cli"),
+                fake_run,
+            )
+
+        message = str(caught.exception)
+        self.assertIn("bootstrap failed", message)
+        self.assertIn("cleanup bootout failed", message)
+        self.assertIn("cleanup input/output error", message)
+        self.assertNotIn("restored", message)
+        self.assertEqual(
+            (runtime_dir / "manage_booking.py").read_text(),
+            "# manager\n",
+        )
+        self.assertEqual(
+            (runtime_dir / "run_booking.py").read_text(),
+            "# runner\n",
+        )
+        with self.plist_path.open("rb") as handle:
+            live_plist = plistlib.load(handle)
+        self.assertEqual(
+            live_plist["ProgramArguments"][1],
+            str(runtime_dir / "run_booking.py"),
+        )
+        runtime_backups = list(self.state_dir.glob(".runtime.*.backup"))
+        plist_backups = list(
+            self.plist_path.parent.glob(f".{self.plist_path.name}.*.backup")
+        )
+        self.assertEqual(len(runtime_backups), 1)
+        self.assertEqual(len(plist_backups), 1)
+        self.assertEqual(
+            (runtime_backups[0] / "manage_booking.py").read_text(),
+            "old manager\n",
+        )
+        self.assertEqual(
+            (runtime_backups[0] / "run_booking.py").read_text(),
+            "old runner\n",
+        )
+        self.assertEqual(plist_backups[0].read_bytes(), old_plist_bytes)
+        self.assertEqual(list(self.state_dir.glob(".runtime.*.new")), [])
+        self.assertEqual(
+            list(self.plist_path.parent.glob(f".{self.plist_path.name}.*.new")),
+            [],
+        )
+        self.assertEqual(
+            calls,
+            [
+                self.launchctl_call("bootout"),
+                self.launchctl_call("bootstrap"),
+                self.launchctl_call("bootout"),
+            ],
         )
 
     def test_uninstall_preserves_history(self):

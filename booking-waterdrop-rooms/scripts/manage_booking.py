@@ -377,9 +377,12 @@ def install_scheduler(
     except Exception as install_error:
         if new_plist_installed:
             try:
-                _launchctl("bootout", plist_path, run_command)
-            except Exception:
-                pass
+                _bootout(plist_path, run_command)
+            except Exception as cleanup_error:
+                raise RuntimeError(
+                    f"{install_error}; cleanup bootout failed: {cleanup_error}; "
+                    "new live files and any previous-version backups were preserved"
+                ) from install_error
             _remove_path(plist_path)
         if new_runtime_installed:
             _remove_path(runtime_dir)
