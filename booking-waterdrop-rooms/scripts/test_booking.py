@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
+import plistlib
 import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest import mock
 from zoneinfo import ZoneInfo
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -95,6 +99,114 @@ class PlanStateTests(unittest.TestCase):
         )
         manage.clear_pending_update(self.state_dir)
         self.assertIsNone(manage.load_pending_update(self.state_dir))
+
+
+class SchedulerTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.state_dir = self.root / "state"
+        self.plist_path = self.root / "LaunchAgents" / f"{manage.LABEL}.plist"
+        self.source_dir = self.root / "source"
+        self.source_dir.mkdir()
+        (self.source_dir / "manage_booking.py").write_text("# manager\n")
+        (self.source_dir / "run_booking.py").write_text("# runner\n")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_launch_agent_runs_daily_at_0859(self):
+        payload = manage.build_launch_agent(
+            Path("/usr/bin/python3"),
+            self.state_dir / "runtime" / "run_booking.py",
+            self.state_dir,
+            Path("/opt/homebrew/bin/lark-cli"),
+        )
+        self.assertEqual(payload["Label"], manage.LABEL)
+        self.assertEqual(
+            payload["StartCalendarInterval"], {"Hour": 8, "Minute": 59}
+        )
+        self.assertEqual(payload["EnvironmentVariables"]["TZ"], "Asia/Shanghai")
+        self.assertEqual(payload["StandardOutPath"], "/dev/null")
+        self.assertEqual(payload["StandardErrorPath"], "/dev/null")
+
+    def test_install_copies_runtime_and_bootstraps_agent(self):
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        result = manage.install_scheduler(
+            self.source_dir,
+            self.state_dir,
+            self.plist_path,
+            Path("/usr/bin/python3"),
+            Path("/opt/homebrew/bin/lark-cli"),
+            fake_run,
+        )
+        self.assertEqual(result["status"], "installed")
+        self.assertTrue((self.state_dir / "runtime" / "run_booking.py").exists())
+        with self.plist_path.open("rb") as handle:
+            plist = plistlib.load(handle)
+        self.assertEqual(plist["StartCalendarInterval"]["Minute"], 59)
+        self.assertTrue(any("bootstrap" in call for call in calls))
+
+    def test_uninstall_preserves_history(self):
+        (self.state_dir / "history").mkdir(parents=True)
+        (self.state_dir / "history" / "result.json").write_text("{}")
+        self.plist_path.parent.mkdir(parents=True)
+        self.plist_path.write_text("plist")
+        manage._atomic_write_json(
+            manage.update_state_path(self.state_dir),
+            {"status": "needs_approval"},
+        )
+        result = manage.uninstall_scheduler(
+            self.state_dir,
+            self.plist_path,
+            lambda argv, **kwargs: mock.Mock(
+                returncode=0, stdout="", stderr=""
+            ),
+        )
+        self.assertEqual(result["status"], "uninstalled")
+        self.assertTrue((self.state_dir / "history" / "result.json").exists())
+        self.assertIsNone(manage.load_pending_update(self.state_dir))
+        self.assertFalse(self.plist_path.exists())
+
+    def test_management_cli_exposes_required_commands(self):
+        parser = manage.build_parser()
+        common = ["--state-dir", str(self.state_dir)]
+        for command in ("install", "status", "cancel", "clear-update", "uninstall"):
+            with self.subTest(command=command):
+                self.assertEqual(parser.parse_args([*common, command]).command, command)
+        created = parser.parse_args(
+            [
+                *common,
+                "create",
+                "--slot",
+                "10:00-11:00",
+                "--slot",
+                "15:00-16:00",
+            ]
+        )
+        self.assertEqual(created.command, "create")
+        self.assertEqual(created.slot, ["10:00-11:00", "15:00-16:00"])
+
+    def test_status_cli_emits_json_without_external_commands(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            exit_code = manage.main(
+                ["--state-dir", str(self.state_dir), "status"]
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {
+                "pending": None,
+                "latest_result": None,
+                "pending_update": None,
+            },
+        )
 
 
 if __name__ == "__main__":

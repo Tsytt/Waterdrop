@@ -5,9 +5,14 @@ import contextlib
 import fcntl
 import json
 import os
+import plistlib
 import re
+import shutil
+import subprocess
+import sys
 import tempfile
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -21,6 +26,7 @@ TZ = ZoneInfo("Asia/Shanghai")
 TIME_RANGE_RE = re.compile(
     r"^\s*(\d{1,2}):(\d{2})\s*[-–—~]\s*(\d{1,2}):(\d{2})\s*$"
 )
+RunCommand = Callable[..., object]
 
 
 class ExistingPlanError(RuntimeError):
@@ -204,3 +210,170 @@ def cancel_plan(state_dir: Path) -> dict | None:
         _atomic_write_json(history_dir / f"{plan['plan_id']}.json", plan)
         plan_path(state_dir).unlink(missing_ok=True)
         return plan
+
+
+def build_launch_agent(
+    python_bin: Path,
+    runtime_script: Path,
+    state_dir: Path,
+    lark_bin: Path,
+) -> dict:
+    return {
+        "Label": LABEL,
+        "ProgramArguments": [
+            str(python_bin),
+            str(runtime_script),
+            "--state-dir",
+            str(state_dir),
+        ],
+        "StartCalendarInterval": {"Hour": 8, "Minute": 59},
+        "ProcessType": "Background",
+        "EnvironmentVariables": {
+            "TZ": "Asia/Shanghai",
+            "PYTHONUNBUFFERED": "1",
+            "LARK_CLI_BIN": str(lark_bin),
+        },
+        "StandardOutPath": "/dev/null",
+        "StandardErrorPath": "/dev/null",
+    }
+
+
+def _write_plist(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            plistlib.dump(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _launch_domain() -> str:
+    return f"gui/{os.getuid()}"
+
+
+def install_scheduler(
+    source_dir: Path,
+    state_dir: Path,
+    plist_path: Path,
+    python_bin: Path,
+    lark_bin: Path,
+    run_command: RunCommand = subprocess.run,
+) -> dict:
+    runtime_dir = state_dir / "runtime"
+    log_dir = state_dir / "logs"
+    runtime_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(runtime_dir, 0o700)
+    os.chmod(log_dir, 0o700)
+    for name in ("manage_booking.py", "run_booking.py"):
+        shutil.copy2(source_dir / name, runtime_dir / name)
+        os.chmod(runtime_dir / name, 0o700)
+    payload = build_launch_agent(
+        python_bin,
+        runtime_dir / "run_booking.py",
+        state_dir,
+        lark_bin,
+    )
+    _write_plist(plist_path, payload)
+    run_command(
+        ["launchctl", "bootout", _launch_domain(), str(plist_path)],
+        text=True,
+        capture_output=True,
+    )
+    result = run_command(
+        ["launchctl", "bootstrap", _launch_domain(), str(plist_path)],
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"launchctl bootstrap failed: {result.stderr.strip()}")
+    return {"status": "installed", "plist": str(plist_path)}
+
+
+def uninstall_scheduler(
+    state_dir: Path,
+    plist_path: Path,
+    run_command: RunCommand = subprocess.run,
+) -> dict:
+    run_command(
+        ["launchctl", "bootout", _launch_domain(), str(plist_path)],
+        text=True,
+        capture_output=True,
+    )
+    plist_path.unlink(missing_ok=True)
+    plan_path(state_dir).unlink(missing_ok=True)
+    update_state_path(state_dir).unlink(missing_ok=True)
+    shutil.rmtree(state_dir / "runtime", ignore_errors=True)
+    return {"status": "uninstalled", "history_preserved": True}
+
+
+def _json_print(payload: dict) -> None:
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=APP_NAME)
+    parser.add_argument("--state-dir", type=Path, default=default_state_dir())
+    subcommands = parser.add_subparsers(dest="command", required=True)
+
+    subcommands.add_parser("status")
+    subcommands.add_parser("cancel")
+    subcommands.add_parser("clear-update")
+    subcommands.add_parser("uninstall")
+    subcommands.add_parser("install")
+
+    create = subcommands.add_parser("create")
+    create.add_argument("--slot", action="append", required=True)
+    create.add_argument("--replace", action="store_true")
+    create.add_argument("--now")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    state_dir = args.state_dir
+    plist_path = Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+    source_dir = Path(__file__).resolve().parent
+    if args.command == "status":
+        _json_print({
+            "pending": load_plan(state_dir),
+            "latest_result": latest_result(state_dir),
+            "pending_update": load_pending_update(state_dir),
+        })
+        return 0
+    if args.command == "cancel":
+        _json_print({"canceled": cancel_plan(state_dir)})
+        return 0
+    if args.command == "clear-update":
+        _json_print({"cleared_update": clear_pending_update(state_dir)})
+        return 0
+    if args.command == "create":
+        now = datetime.fromisoformat(args.now) if args.now else datetime.now(TZ)
+        ranges = validate_ranges(args.slot)
+        _json_print(create_plan(state_dir, ranges, now, replace=args.replace))
+        return 0
+    if args.command == "install":
+        python_bin = Path(sys.executable).resolve()
+        lark_path = shutil.which("lark-cli")
+        if not lark_path:
+            raise RuntimeError("lark-cli is required")
+        _json_print(
+            install_scheduler(
+                source_dir, state_dir, plist_path, python_bin, Path(lark_path)
+            )
+        )
+        return 0
+    if args.command == "uninstall":
+        _json_print(uninstall_scheduler(state_dir, plist_path))
+        return 0
+    raise AssertionError(args.command)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
