@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import fcntl
 import json
 import os
 import plistlib
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -27,6 +29,36 @@ TIME_RANGE_RE = re.compile(
     r"^\s*(\d{1,2}):(\d{2})\s*[-–—~]\s*(\d{1,2}):(\d{2})\s*$"
 )
 RunCommand = Callable[..., object]
+LAUNCHCTL_TIMEOUT = 10
+POLL_INTERVAL_SECONDS = 15
+CANCEL_TRANSACTION_NAME = ".cancel-transaction.json"
+CANCEL_TOMBSTONE_NAME = ".cancel-pending.json"
+SCHEDULER_TRANSACTION_NAME = ".scheduler-transaction.json"
+PLAN_ALLOWED_KEYS = frozenset(
+    {
+        "schema_version",
+        "plan_id",
+        "created_at",
+        "execution_date",
+        "target_date",
+        "status",
+        "slots",
+    }
+)
+SLOT_ALLOWED_KEYS = frozenset(
+    {
+        "slot_id",
+        "start",
+        "end",
+        "status",
+        "room_id",
+        "room_name",
+        "event_id",
+        "error",
+    }
+)
+HISTORY_ALLOWED_KEYS = frozenset({*PLAN_ALLOWED_KEYS, "completed_at"})
+SAFE_SLOT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 
 class ExistingPlanError(RuntimeError):
@@ -99,8 +131,231 @@ def update_state_path(state_dir: Path) -> Path:
     return state_dir / "pending-update.json"
 
 
+def _path_exists(path: Path) -> bool:
+    return os.path.lexists(path)
+
+
+def _ensure_safe_directory(
+    path: Path,
+    *,
+    create: bool,
+    mode: int = 0o700,
+    label: str = "directory",
+) -> None:
+    if create:
+        path.mkdir(parents=True, exist_ok=True, mode=mode)
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        if create:
+            raise
+        return
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError(f"unsafe {label}: symbolic link or non-directory")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ValueError(f"unsafe {label}") from exc
+    try:
+        if create:
+            os.fchmod(descriptor, mode)
+    finally:
+        os.close(descriptor)
+
+
+def _ensure_safe_state_dir(state_dir: Path, *, create: bool) -> None:
+    _ensure_safe_directory(
+        state_dir,
+        create=create,
+        mode=0o700,
+        label="state directory",
+    )
+
+
+def _read_json_no_follow(path: Path, *, label: str) -> object | None:
+    if not _path_exists(path):
+        return None
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(metadata.st_mode):
+        raise ValueError(f"unsafe {label}: symbolic link")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"unsafe {label}: non-regular file")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            return None
+        raise ValueError(f"unsafe {label}") from exc
+    try:
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            try:
+                return json.load(handle)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid {label}: malformed JSON") from exc
+    except Exception:
+        # fdopen owns the descriptor once constructed. If construction itself
+        # failed, close the raw descriptor here.
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
+
+
+def _canonical_uuid(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("invalid plan id")
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError) as exc:
+        raise ValueError("invalid plan id") from exc
+    if str(parsed) != value:
+        raise ValueError("invalid plan id")
+    return value
+
+
+def _validate_plan(plan: object) -> dict:
+    try:
+        if not isinstance(plan, dict) or set(plan) != PLAN_ALLOWED_KEYS:
+            raise ValueError
+        _canonical_uuid(plan["plan_id"])
+        if type(plan["schema_version"]) is not int or plan["schema_version"] != 1:
+            raise ValueError
+        created_at = datetime.fromisoformat(plan["created_at"])
+        if created_at.tzinfo is None:
+            raise ValueError
+        execution = date.fromisoformat(plan["execution_date"])
+        target = date.fromisoformat(plan["target_date"])
+        if target != execution + timedelta(days=2) or plan["status"] != "pending":
+            raise ValueError
+        slots = plan["slots"]
+        if not isinstance(slots, list) or len(slots) != 2:
+            raise ValueError
+        if any(not isinstance(slot, dict) or set(slot) != SLOT_ALLOWED_KEYS for slot in slots):
+            raise ValueError
+        validate_ranges([f"{slot['start']}-{slot['end']}" for slot in slots])
+        slot_ids = [slot["slot_id"] for slot in slots]
+        if len(set(slot_ids)) != 2 or any(
+            not isinstance(slot_id, str)
+            or SAFE_SLOT_ID_RE.fullmatch(slot_id) is None
+            for slot_id in slot_ids
+        ):
+            raise ValueError
+        for slot in slots:
+            slot_status = slot["status"]
+            room_id = slot["room_id"]
+            room_name = slot["room_name"]
+            event_id = slot["event_id"]
+            error = slot["error"]
+            if slot_status == "pending":
+                valid = all(
+                    value is None
+                    for value in (room_id, room_name, event_id, error)
+                )
+            elif slot_status == "success":
+                valid = (
+                    isinstance(room_id, str)
+                    and room_id.startswith("omm_")
+                    and isinstance(room_name, str)
+                    and room_name.startswith("水滴大厦-")
+                    and isinstance(event_id, str)
+                    and bool(event_id.strip())
+                    and error is None
+                )
+            elif slot_status == "uncertain":
+                valid = (
+                    isinstance(room_id, str)
+                    and room_id.startswith("omm_")
+                    and isinstance(room_name, str)
+                    and room_name.startswith("水滴大厦-")
+                    and event_id is None
+                    and isinstance(error, str)
+                    and bool(error.strip())
+                )
+            elif slot_status == "failed":
+                valid = (
+                    room_id is None
+                    and room_name is None
+                    and event_id is None
+                    and isinstance(error, str)
+                    and bool(error.strip())
+                )
+            else:
+                valid = False
+            if not valid:
+                raise ValueError
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise ValueError("invalid plan state") from exc
+    return plan
+
+
+def _validate_history(result: object) -> dict:
+    try:
+        if not isinstance(result, dict) or set(result) not in {
+            PLAN_ALLOWED_KEYS,
+            HISTORY_ALLOWED_KEYS,
+        }:
+            raise ValueError
+        _canonical_uuid(result["plan_id"])
+        status = result["status"]
+        if status == "pending":
+            return _validate_plan(result)
+        if status not in {"canceled", "success", "partial", "failed", "missed"}:
+            raise ValueError
+        if status == "canceled":
+            if set(result) != PLAN_ALLOWED_KEYS:
+                raise ValueError
+            _validate_plan({**result, "status": "pending"})
+            return result
+        if type(result["schema_version"]) is not int or result["schema_version"] != 1:
+            raise ValueError
+        datetime.fromisoformat(result["created_at"])
+        date.fromisoformat(result["execution_date"])
+        date.fromisoformat(result["target_date"])
+        slots = result["slots"]
+        if not isinstance(slots, list) or len(slots) != 2:
+            raise ValueError
+        if any(not isinstance(slot, dict) or set(slot) != SLOT_ALLOWED_KEYS for slot in slots):
+            raise ValueError
+        validate_ranges([f"{slot['start']}-{slot['end']}" for slot in slots])
+        if "completed_at" in result:
+            datetime.fromisoformat(result["completed_at"])
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise ValueError("invalid history result") from exc
+    return result
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _atomic_write_json(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _ensure_safe_directory(
+        path.parent,
+        create=True,
+        mode=0o700,
+        label="state subdirectory",
+    )
+    if _path_exists(path) and path.is_symlink():
+        raise ValueError("unsafe JSON target: symbolic link")
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -110,6 +365,7 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
             os.fsync(handle.fileno())
         os.chmod(temporary, 0o600)
         os.replace(temporary, path)
+        _fsync_directory(path.parent)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
@@ -117,44 +373,71 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
 
 @contextlib.contextmanager
 def locked_state(state_dir: Path) -> Iterator[None]:
-    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(state_dir, 0o700)
+    _ensure_safe_state_dir(state_dir, create=True)
     lock_path = state_dir / "state.lock"
-    with lock_path.open("a+", encoding="utf-8") as handle:
-        os.chmod(lock_path, 0o600)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise ValueError("unsafe state lock") from exc
+    with os.fdopen(descriptor, "a+", encoding="utf-8") as handle:
+        os.fchmod(handle.fileno(), 0o600)
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
+            _recover_cancel_transaction_unlocked(state_dir)
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def load_plan(state_dir: Path) -> dict | None:
-    path = plan_path(state_dir)
-    if not path.exists():
+    _ensure_safe_state_dir(state_dir, create=False)
+    payload = _read_json_no_follow(plan_path(state_dir), label="plan")
+    if payload is None:
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    return _validate_plan(payload)
 
 
 def latest_result(state_dir: Path) -> dict | None:
+    _ensure_safe_state_dir(state_dir, create=False)
     history_dir = state_dir / "history"
-    if not history_dir.exists():
+    if not _path_exists(history_dir):
         return None
-    candidates = [
-        path for path in history_dir.glob("*.json")
-        if path.is_file() and not path.is_symlink()
-    ]
+    _ensure_safe_directory(
+        history_dir,
+        create=False,
+        label="history directory",
+    )
+    candidates = []
+    for path in history_dir.glob("*.json"):
+        metadata = os.lstat(path)
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError("unsafe history result: symbolic link")
+        if stat.S_ISREG(metadata.st_mode):
+            candidates.append((metadata.st_mtime_ns, path))
     if not candidates:
         return None
-    newest = max(candidates, key=lambda path: path.stat().st_mtime_ns)
-    return json.loads(newest.read_text(encoding="utf-8"))
+    newest = max(candidates, key=lambda item: item[0])[1]
+    payload = _read_json_no_follow(newest, label="history result")
+    result = _validate_history(payload)
+    if newest.stem != result["plan_id"]:
+        raise ValueError("history path does not match plan id")
+    return result
 
 
 def load_pending_update(state_dir: Path) -> dict | None:
-    path = update_state_path(state_dir)
-    if not path.exists():
+    _ensure_safe_state_dir(state_dir, create=False)
+    payload = _read_json_no_follow(
+        update_state_path(state_dir),
+        label="pending update",
+    )
+    if payload is None:
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("invalid pending update")
+    return payload
 
 
 def clear_pending_update(state_dir: Path) -> dict | None:
@@ -200,16 +483,101 @@ def create_plan(
         return plan
 
 
+def _history_path(state_dir: Path, plan_id: object) -> Path:
+    canonical = _canonical_uuid(plan_id)
+    _ensure_safe_state_dir(state_dir, create=True)
+    history_dir = state_dir / "history"
+    _ensure_safe_directory(
+        history_dir,
+        create=True,
+        mode=0o700,
+        label="history directory",
+    )
+    candidate = history_dir / f"{canonical}.json"
+    if candidate.parent != history_dir:
+        raise ValueError("history path is not confined")
+    return candidate
+
+
+def _cancel_transaction_path(state_dir: Path) -> Path:
+    return state_dir / CANCEL_TRANSACTION_NAME
+
+
+def _cancel_tombstone_path(state_dir: Path) -> Path:
+    return state_dir / CANCEL_TOMBSTONE_NAME
+
+
+def _validate_cancel_transaction(payload: object) -> dict:
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"operation", "plan"}
+        or payload.get("operation") != "cancel"
+    ):
+        raise ValueError("invalid cancellation transaction")
+    plan = payload.get("plan")
+    validated = _validate_history(plan)
+    if validated["status"] != "canceled":
+        raise ValueError("invalid cancellation transaction")
+    return payload
+
+
+def _recover_cancel_transaction_unlocked(state_dir: Path) -> None:
+    marker_path = _cancel_transaction_path(state_dir)
+    marker = _read_json_no_follow(
+        marker_path,
+        label="cancellation transaction",
+    )
+    if marker is None:
+        if _path_exists(_cancel_tombstone_path(state_dir)):
+            raise ValueError("orphaned cancellation tombstone")
+        return
+    transaction = _validate_cancel_transaction(marker)
+    canceled = transaction["plan"]
+    pending_path = plan_path(state_dir)
+    tombstone_path = _cancel_tombstone_path(state_dir)
+    if _path_exists(pending_path):
+        pending = load_plan(state_dir)
+        if pending is None or pending["plan_id"] != canceled["plan_id"]:
+            raise ValueError("cancellation transaction plan mismatch")
+        if _path_exists(tombstone_path):
+            raise ValueError("duplicate cancellation tombstone")
+        os.replace(pending_path, tombstone_path)
+        _fsync_directory(state_dir)
+    if _path_exists(tombstone_path):
+        tombstone = _read_json_no_follow(
+            tombstone_path,
+            label="cancellation tombstone",
+        )
+        pending = _validate_plan(tombstone)
+        if pending["plan_id"] != canceled["plan_id"]:
+            raise ValueError("cancellation tombstone plan mismatch")
+    _atomic_write_json(
+        _history_path(state_dir, canceled["plan_id"]),
+        canceled,
+    )
+    tombstone_path.unlink(missing_ok=True)
+    marker_path.unlink(missing_ok=True)
+
+
 def cancel_plan(state_dir: Path) -> dict | None:
     with locked_state(state_dir):
         plan = load_plan(state_dir)
         if not plan:
             return None
-        plan["status"] = "canceled"
-        history_dir = state_dir / "history"
-        _atomic_write_json(history_dir / f"{plan['plan_id']}.json", plan)
-        plan_path(state_dir).unlink(missing_ok=True)
-        return plan
+        canceled = {**plan, "status": "canceled"}
+        _atomic_write_json(
+            _cancel_transaction_path(state_dir),
+            {"operation": "cancel", "plan": canceled},
+        )
+        os.replace(plan_path(state_dir), _cancel_tombstone_path(state_dir))
+        _fsync_directory(state_dir)
+        _atomic_write_json(
+            _history_path(state_dir, canceled["plan_id"]),
+            canceled,
+        )
+        _cancel_tombstone_path(state_dir).unlink(missing_ok=True)
+        _cancel_transaction_path(state_dir).unlink(missing_ok=True)
+        return canceled
 
 
 def build_launch_agent(
@@ -226,7 +594,10 @@ def build_launch_agent(
             "--state-dir",
             str(state_dir),
         ],
-        "StartCalendarInterval": {"Hour": 8, "Minute": 59},
+        # launchd calendar intervals use the Mac's system timezone. Polling is
+        # timezone-independent; the runner itself decides in Asia/Shanghai and
+        # returns immediately when no plan is due.
+        "StartInterval": POLL_INTERVAL_SECONDS,
         "ProcessType": "Background",
         "EnvironmentVariables": {
             "TZ": "Asia/Shanghai",
@@ -262,11 +633,18 @@ def _launchctl(
     plist_path: Path,
     run_command: RunCommand,
 ) -> object:
-    return run_command(
-        ["launchctl", action, _launch_domain(), str(plist_path)],
-        text=True,
-        capture_output=True,
-    )
+    argv = ["launchctl", action, _launch_domain(), str(plist_path)]
+    try:
+        return run_command(
+            argv,
+            text=True,
+            capture_output=True,
+            timeout=LAUNCHCTL_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"launchctl {action} timed out") from exc
+    except OSError as exc:
+        raise RuntimeError(f"launchctl {action} could not be started") from exc
 
 
 def _launchctl_error(result: object) -> str:
@@ -306,10 +684,6 @@ def _bootstrap(plist_path: Path, run_command: RunCommand) -> None:
         raise RuntimeError(f"launchctl bootstrap failed: {_launchctl_error(result)}")
 
 
-def _path_exists(path: Path) -> bool:
-    return os.path.lexists(path)
-
-
 def _remove_path(path: Path) -> None:
     if not _path_exists(path):
         return
@@ -319,26 +693,171 @@ def _remove_path(path: Path) -> None:
         path.unlink()
 
 
-def install_scheduler(
+def _scheduler_transaction_path(state_dir: Path) -> Path:
+    return state_dir / SCHEDULER_TRANSACTION_NAME
+
+
+def _scheduler_artifact_paths(
+    state_dir: Path,
+    plist_path: Path,
+    token: str,
+) -> tuple[Path, Path, Path, Path]:
+    return (
+        state_dir / f".runtime.{token}.new",
+        state_dir / f".runtime.{token}.backup",
+        plist_path.parent / f".{plist_path.name}.{token}.new",
+        plist_path.parent / f".{plist_path.name}.{token}.backup",
+    )
+
+
+def _validate_scheduler_transaction(payload: object) -> dict:
+    if not isinstance(payload, dict) or payload.get("operation") not in {
+        "install",
+        "uninstall",
+    }:
+        raise ValueError("invalid scheduler transaction")
+    if payload["operation"] == "uninstall":
+        if set(payload) != {"operation", "phase"} or payload["phase"] != "prepared":
+            raise ValueError("invalid scheduler transaction")
+        return payload
+    if set(payload) != {
+        "operation",
+        "phase",
+        "token",
+        "old_runtime",
+        "old_plist",
+        "old_agent_was_loaded",
+    }:
+        raise ValueError("invalid scheduler transaction")
+    if payload["phase"] not in {"prepared", "committed"}:
+        raise ValueError("invalid scheduler transaction")
+    if not isinstance(payload["token"], str) or re.fullmatch(
+        r"[0-9a-f]{32}", payload["token"]
+    ) is None:
+        raise ValueError("invalid scheduler transaction")
+    if type(payload["old_runtime"]) is not bool or type(payload["old_plist"]) is not bool:
+        raise ValueError("invalid scheduler transaction")
+    if payload["old_agent_was_loaded"] not in {None, True, False}:
+        raise ValueError("invalid scheduler transaction")
+    return payload
+
+
+def _cleanup_scheduler_orphans(state_dir: Path, plist_path: Path) -> None:
+    for pattern in (".runtime.*.new", ".runtime.*.backup"):
+        for path in state_dir.glob(pattern):
+            _remove_path(path)
+    if plist_path.parent.exists():
+        for suffix in ("new", "backup"):
+            for path in plist_path.parent.glob(
+                f".{plist_path.name}.*.{suffix}"
+            ):
+                _remove_path(path)
+
+
+def _finish_uninstall_unlocked(
+    state_dir: Path,
+    plist_path: Path,
+    run_command: RunCommand,
+) -> None:
+    _bootout(plist_path, run_command)
+    _remove_path(plist_path)
+    _remove_path(plan_path(state_dir))
+    _remove_path(update_state_path(state_dir))
+    _remove_path(state_dir / "runtime")
+
+
+def _recover_scheduler_transaction_unlocked(
+    state_dir: Path,
+    plist_path: Path,
+    run_command: RunCommand,
+) -> None:
+    marker_path = _scheduler_transaction_path(state_dir)
+    payload = _read_json_no_follow(
+        marker_path,
+        label="scheduler transaction",
+    )
+    if payload is None:
+        _cleanup_scheduler_orphans(state_dir, plist_path)
+        return
+    transaction = _validate_scheduler_transaction(payload)
+    if transaction["operation"] == "uninstall":
+        _finish_uninstall_unlocked(state_dir, plist_path, run_command)
+        marker_path.unlink(missing_ok=True)
+        _cleanup_scheduler_orphans(state_dir, plist_path)
+        return
+
+    runtime_dir = state_dir / "runtime"
+    staged_runtime, backup_runtime, staged_plist, backup_plist = (
+        _scheduler_artifact_paths(
+            state_dir,
+            plist_path,
+            transaction["token"],
+        )
+    )
+    # Always establish a known unloaded baseline before choosing old or new.
+    # If the previous process died inside bootout, repeating it is safe.
+    _bootout(plist_path, run_command)
+    if transaction["phase"] == "committed":
+        if not _path_exists(runtime_dir) or not _path_exists(plist_path):
+            raise RuntimeError("committed scheduler transaction is incomplete")
+        _bootstrap(plist_path, run_command)
+        for path in (
+            staged_runtime,
+            backup_runtime,
+            staged_plist,
+            backup_plist,
+        ):
+            _remove_path(path)
+        marker_path.unlink(missing_ok=True)
+        _cleanup_scheduler_orphans(state_dir, plist_path)
+        return
+
+    if _path_exists(backup_runtime):
+        _remove_path(runtime_dir)
+        os.replace(backup_runtime, runtime_dir)
+    elif not transaction["old_runtime"]:
+        _remove_path(runtime_dir)
+    elif not _path_exists(runtime_dir):
+        raise RuntimeError("previous runtime cannot be recovered")
+
+    if _path_exists(backup_plist):
+        _remove_path(plist_path)
+        os.replace(backup_plist, plist_path)
+    elif not transaction["old_plist"]:
+        _remove_path(plist_path)
+    elif not _path_exists(plist_path):
+        raise RuntimeError("previous plist cannot be recovered")
+
+    _remove_path(staged_runtime)
+    _remove_path(staged_plist)
+    if (
+        transaction["old_plist"]
+        and transaction["old_agent_was_loaded"] is not False
+    ):
+        _bootstrap(plist_path, run_command)
+    marker_path.unlink(missing_ok=True)
+    _cleanup_scheduler_orphans(state_dir, plist_path)
+
+
+def _install_scheduler_unlocked(
     source_dir: Path,
     state_dir: Path,
     plist_path: Path,
     python_bin: Path,
     lark_bin: Path,
-    run_command: RunCommand = subprocess.run,
+    run_command: RunCommand,
 ) -> dict:
-    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(state_dir, 0o700)
     runtime_dir = state_dir / "runtime"
-    log_dir = state_dir / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(log_dir, 0o700)
-
+    _ensure_safe_directory(
+        state_dir / "logs",
+        create=True,
+        mode=0o700,
+        label="log directory",
+    )
     token = uuid.uuid4().hex
-    staged_runtime = state_dir / f".runtime.{token}.new"
-    backup_runtime = state_dir / f".runtime.{token}.backup"
-    staged_plist = plist_path.parent / f".{plist_path.name}.{token}.new"
-    backup_plist = plist_path.parent / f".{plist_path.name}.{token}.backup"
+    staged_runtime, backup_runtime, staged_plist, backup_plist = (
+        _scheduler_artifact_paths(state_dir, plist_path, token)
+    )
     staged_runtime.mkdir(mode=0o700)
     os.chmod(staged_runtime, 0o700)
     try:
@@ -357,54 +876,92 @@ def install_scheduler(
         _remove_path(staged_plist)
         raise
 
-    old_runtime = _path_exists(runtime_dir)
-    old_plist = _path_exists(plist_path)
-    new_runtime_installed = False
-    new_plist_installed = False
-    old_agent_was_loaded = False
+    transaction = {
+        "operation": "install",
+        "phase": "prepared",
+        "token": token,
+        "old_runtime": _path_exists(runtime_dir),
+        "old_plist": _path_exists(plist_path),
+        "old_agent_was_loaded": None,
+    }
+    _atomic_write_json(_scheduler_transaction_path(state_dir), transaction)
     try:
         bootout_result = _bootout(plist_path, run_command)
-        old_agent_was_loaded = getattr(bootout_result, "returncode", 1) == 0
-        if old_runtime:
+        transaction["old_agent_was_loaded"] = (
+            getattr(bootout_result, "returncode", 1) == 0
+        )
+        _atomic_write_json(_scheduler_transaction_path(state_dir), transaction)
+        if transaction["old_runtime"]:
             os.replace(runtime_dir, backup_runtime)
-        if old_plist:
+        if transaction["old_plist"]:
             os.replace(plist_path, backup_plist)
         os.replace(staged_runtime, runtime_dir)
-        new_runtime_installed = True
         os.replace(staged_plist, plist_path)
-        new_plist_installed = True
         _bootstrap(plist_path, run_command)
+        transaction["phase"] = "committed"
+        _atomic_write_json(_scheduler_transaction_path(state_dir), transaction)
     except Exception as install_error:
-        if new_plist_installed:
-            try:
-                _bootout(plist_path, run_command)
-            except Exception as cleanup_error:
-                raise RuntimeError(
-                    f"{install_error}; cleanup bootout failed: {cleanup_error}; "
-                    "new live files and any previous-version backups were preserved"
-                ) from install_error
-            _remove_path(plist_path)
-        if new_runtime_installed:
-            _remove_path(runtime_dir)
-        if old_runtime and _path_exists(backup_runtime):
-            os.replace(backup_runtime, runtime_dir)
-        if old_plist and _path_exists(backup_plist):
-            os.replace(backup_plist, plist_path)
-        if old_agent_was_loaded and old_plist:
-            try:
-                _bootstrap(plist_path, run_command)
-            except Exception as restore_error:
-                raise RuntimeError(
-                    f"{install_error}; previous agent restore failed: {restore_error}"
-                ) from install_error
+        try:
+            _recover_scheduler_transaction_unlocked(
+                state_dir,
+                plist_path,
+                run_command,
+            )
+        except Exception as recovery_error:
+            raise RuntimeError(
+                f"{install_error}; cleanup bootout failed: {recovery_error}; "
+                "live files and recovery artifacts were preserved"
+            ) from install_error
         raise
-    else:
-        _remove_path(backup_runtime)
-        _remove_path(backup_plist)
-        return {"status": "installed", "plist": str(plist_path)}
-    finally:
-        _remove_path(staged_runtime)
-        _remove_path(staged_plist)
+    for path in (
+        backup_runtime,
+        backup_plist,
+        staged_runtime,
+        staged_plist,
+    ):
+        _remove_path(path)
+    _scheduler_transaction_path(state_dir).unlink(missing_ok=True)
+    _cleanup_scheduler_orphans(state_dir, plist_path)
+    return {"status": "installed", "plist": str(plist_path)}
+
+
+def install_scheduler(
+    source_dir: Path,
+    state_dir: Path,
+    plist_path: Path,
+    python_bin: Path,
+    lark_bin: Path,
+    run_command: RunCommand = subprocess.run,
+) -> dict:
+    with locked_state(state_dir):
+        _recover_scheduler_transaction_unlocked(
+            state_dir,
+            plist_path,
+            run_command,
+        )
+        return _install_scheduler_unlocked(
+            source_dir,
+            state_dir,
+            plist_path,
+            python_bin,
+            lark_bin,
+            run_command,
+        )
+
+
+def _uninstall_scheduler_unlocked(
+    state_dir: Path,
+    plist_path: Path,
+    run_command: RunCommand,
+) -> dict:
+    _atomic_write_json(
+        _scheduler_transaction_path(state_dir),
+        {"operation": "uninstall", "phase": "prepared"},
+    )
+    _finish_uninstall_unlocked(state_dir, plist_path, run_command)
+    _scheduler_transaction_path(state_dir).unlink(missing_ok=True)
+    _cleanup_scheduler_orphans(state_dir, plist_path)
+    return {"status": "uninstalled", "history_preserved": True}
 
 
 def uninstall_scheduler(
@@ -412,16 +969,30 @@ def uninstall_scheduler(
     plist_path: Path,
     run_command: RunCommand = subprocess.run,
 ) -> dict:
-    _bootout(plist_path, run_command)
-    plist_path.unlink(missing_ok=True)
-    plan_path(state_dir).unlink(missing_ok=True)
-    update_state_path(state_dir).unlink(missing_ok=True)
-    shutil.rmtree(state_dir / "runtime", ignore_errors=True)
-    return {"status": "uninstalled", "history_preserved": True}
+    with locked_state(state_dir):
+        _recover_scheduler_transaction_unlocked(
+            state_dir,
+            plist_path,
+            run_command,
+        )
+        return _uninstall_scheduler_unlocked(
+            state_dir,
+            plist_path,
+            run_command,
+        )
 
 
 def _json_print(payload: dict) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def status_state(state_dir: Path) -> dict:
+    with locked_state(state_dir):
+        return {
+            "pending": load_plan(state_dir),
+            "latest_result": latest_result(state_dir),
+            "pending_update": load_pending_update(state_dir),
+        }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -438,7 +1009,6 @@ def build_parser() -> argparse.ArgumentParser:
     create = subcommands.add_parser("create")
     create.add_argument("--slot", action="append", required=True)
     create.add_argument("--replace", action="store_true")
-    create.add_argument("--now")
     return parser
 
 
@@ -448,11 +1018,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     plist_path = Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
     source_dir = Path(__file__).resolve().parent
     if args.command == "status":
-        _json_print({
-            "pending": load_plan(state_dir),
-            "latest_result": latest_result(state_dir),
-            "pending_update": load_pending_update(state_dir),
-        })
+        _json_print(status_state(state_dir))
         return 0
     if args.command == "cancel":
         _json_print({"canceled": cancel_plan(state_dir)})
@@ -461,9 +1027,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         _json_print({"cleared_update": clear_pending_update(state_dir)})
         return 0
     if args.command == "create":
-        now = datetime.fromisoformat(args.now) if args.now else datetime.now(TZ)
         ranges = validate_ranges(args.slot)
-        _json_print(create_plan(state_dir, ranges, now, replace=args.replace))
+        _json_print(
+            create_plan(
+                state_dir,
+                ranges,
+                datetime.now(TZ),
+                replace=args.replace,
+            )
+        )
         return 0
     if args.command == "install":
         python_bin = Path(sys.executable).resolve()

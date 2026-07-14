@@ -6,6 +6,7 @@ import json
 import os
 import plistlib
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -106,6 +107,155 @@ class PlanStateTests(unittest.TestCase):
         manage.clear_pending_update(self.state_dir)
         self.assertIsNone(manage.load_pending_update(self.state_dir))
 
+    def test_status_rejects_symlinked_pending_plan_without_leaking_it(self):
+        outside = self.state_dir.parent / "secret.json"
+        outside.write_text(
+            json.dumps({"secret": "must-not-be-printed"}),
+            encoding="utf-8",
+        )
+        manage.plan_path(self.state_dir).symlink_to(outside)
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            with self.assertRaisesRegex(ValueError, "symbolic link"):
+                manage.main(["--state-dir", str(self.state_dir), "status"])
+
+        self.assertEqual(output.getvalue(), "")
+        self.assertNotIn("must-not-be-printed", output.getvalue())
+
+    def test_management_rejects_symlinked_state_directory(self):
+        actual = self.state_dir / "actual"
+        actual.mkdir()
+        linked = self.state_dir / "linked"
+        linked.symlink_to(actual, target_is_directory=True)
+
+        for operation in (
+            lambda: manage.load_plan(linked),
+            lambda: manage.cancel_plan(linked),
+            lambda: manage.main(["--state-dir", str(linked), "status"]),
+        ):
+            with self.subTest(operation=operation):
+                with self.assertRaisesRegex(ValueError, "state directory"):
+                    operation()
+
+    def test_latest_result_rejects_symlinked_history_and_result_files(self):
+        outside = self.state_dir / "outside"
+        outside.mkdir()
+        (outside / f"{PLAN_ID}.json").write_text("{}", encoding="utf-8")
+        history = self.state_dir / "history"
+        history.symlink_to(outside, target_is_directory=True)
+
+        with self.assertRaisesRegex(ValueError, "history"):
+            manage.latest_result(self.state_dir)
+
+        history.unlink()
+        history.mkdir()
+        result_link = history / f"{PLAN_ID}.json"
+        result_link.symlink_to(outside / f"{PLAN_ID}.json")
+        with self.assertRaisesRegex(ValueError, "symbolic link"):
+            manage.latest_result(self.state_dir)
+
+    def test_latest_result_requires_filename_to_match_canonical_plan_id(self):
+        result = manage.create_plan(self.state_dir, self.ranges, self.now)
+        manage.plan_path(self.state_dir).unlink()
+        history = self.state_dir / "history"
+        history.mkdir()
+        (history / f"{PLAN_ID}.json").write_text(
+            json.dumps({**result, "status": "canceled"}),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "history path"):
+            manage.latest_result(self.state_dir)
+
+    def test_runner_lock_rejects_orphaned_cancel_tombstone(self):
+        result = manage.create_plan(self.state_dir, self.ranges, self.now)
+        os.replace(
+            manage.plan_path(self.state_dir),
+            self.state_dir / manage.CANCEL_TOMBSTONE_NAME,
+        )
+
+        with self.assertRaisesRegex(ValueError, "tombstone"):
+            with manage.locked_state(self.state_dir):
+                self.fail(f"orphaned canceled plan became executable: {result}")
+
+    def test_load_status_and_cancel_reject_invalid_plans_before_use(self):
+        valid = manage.create_plan(self.state_dir, self.ranges, self.now)
+        invalid_plans = [
+            [valid],
+            {**valid, "unknown": "must-not-be-printed"},
+            {**valid, "plan_id": "../../escape"},
+        ]
+
+        for invalid in invalid_plans:
+            with self.subTest(invalid=type(invalid).__name__):
+                manage._atomic_write_json(manage.plan_path(self.state_dir), invalid)
+                output = io.StringIO()
+                with self.assertRaisesRegex(ValueError, "invalid plan"):
+                    manage.load_plan(self.state_dir)
+                with contextlib.redirect_stdout(output):
+                    with self.assertRaisesRegex(ValueError, "invalid plan"):
+                        manage.main(
+                            ["--state-dir", str(self.state_dir), "status"]
+                        )
+                with self.assertRaisesRegex(ValueError, "invalid plan"):
+                    manage.cancel_plan(self.state_dir)
+                self.assertEqual(output.getvalue(), "")
+                self.assertFalse((self.state_dir.parent / "escape.json").exists())
+
+    def test_cancel_recovers_after_abrupt_exit_at_each_commit_boundary(self):
+        script = """
+import os
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import manage_booking as manage
+state = Path(sys.argv[2])
+boundary = sys.argv[3]
+real_write = manage._atomic_write_json
+real_replace = manage.os.replace
+def write(path, payload):
+    real_write(path, payload)
+    if boundary == 'marker' and path.name == manage.CANCEL_TRANSACTION_NAME:
+        os._exit(91)
+    if boundary == 'history' and path.parent.name == 'history':
+        os._exit(92)
+def replace(source, destination):
+    real_replace(source, destination)
+    if boundary == 'eligibility' and Path(source).name == 'pending-plan.json':
+        os._exit(93)
+manage._atomic_write_json = write
+manage.os.replace = replace
+manage.cancel_plan(state)
+"""
+        scripts = str(SCRIPTS)
+
+        for boundary in ("marker", "eligibility", "history"):
+            with self.subTest(boundary=boundary):
+                case_dir = self.state_dir / boundary
+                plan = manage.create_plan(case_dir, self.ranges, self.now)
+                completed = subprocess.run(
+                    [sys.executable, "-c", script, scripts, str(case_dir), boundary],
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                )
+                self.assertIn(completed.returncode, {91, 92, 93})
+
+                # Runner startup takes this same lock; recovery must consume the
+                # cancellation intent before any caller can see executable work.
+                with manage.locked_state(case_dir):
+                    self.assertIsNone(manage.load_plan(case_dir))
+                latest = manage.latest_result(case_dir)
+                self.assertEqual(latest["plan_id"], plan["plan_id"])
+                self.assertEqual(latest["status"], "canceled")
+                self.assertFalse(
+                    (case_dir / manage.CANCEL_TRANSACTION_NAME).exists()
+                )
+                self.assertFalse(
+                    (case_dir / manage.CANCEL_TOMBSTONE_NAME).exists()
+                )
+
 
 class SchedulerTests(unittest.TestCase):
     def setUp(self):
@@ -129,7 +279,11 @@ class SchedulerTests(unittest.TestCase):
                 manage._launch_domain(),
                 str(self.plist_path),
             ],
-            {"text": True, "capture_output": True},
+            {
+                "text": True,
+                "capture_output": True,
+                "timeout": manage.LAUNCHCTL_TIMEOUT,
+            },
         )
 
     def assert_no_install_artifacts(self):
@@ -142,7 +296,7 @@ class SchedulerTests(unittest.TestCase):
                 [],
             )
 
-    def test_launch_agent_runs_daily_at_0859(self):
+    def test_launch_agent_polling_is_timezone_independent_and_bounded(self):
         payload = manage.build_launch_agent(
             Path("/usr/bin/python3"),
             self.state_dir / "runtime" / "run_booking.py",
@@ -150,9 +304,9 @@ class SchedulerTests(unittest.TestCase):
             Path("/opt/homebrew/bin/lark-cli"),
         )
         self.assertEqual(payload["Label"], manage.LABEL)
-        self.assertEqual(
-            payload["StartCalendarInterval"], {"Hour": 8, "Minute": 59}
-        )
+        self.assertNotIn("StartCalendarInterval", payload)
+        self.assertGreater(payload["StartInterval"], 0)
+        self.assertLessEqual(payload["StartInterval"], 30)
         self.assertEqual(payload["EnvironmentVariables"]["TZ"], "Asia/Shanghai")
         self.assertEqual(payload["StandardOutPath"], "/dev/null")
         self.assertEqual(payload["StandardErrorPath"], "/dev/null")
@@ -180,7 +334,8 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(runner.read_text(), "# runner\n")
         with self.plist_path.open("rb") as handle:
             plist = plistlib.load(handle)
-        self.assertEqual(plist["StartCalendarInterval"]["Minute"], 59)
+        self.assertNotIn("StartCalendarInterval", plist)
+        self.assertLessEqual(plist["StartInterval"], 30)
         self.assertEqual(
             stat.S_IMODE(self.state_dir.stat().st_mode),
             0o700,
@@ -561,6 +716,343 @@ class SchedulerTests(unittest.TestCase):
             "runner\n",
         )
 
+    def test_install_writes_durable_marker_before_bootout_and_recovers_crash(self):
+        runtime_dir = self.state_dir / "runtime"
+        runtime_dir.mkdir(parents=True)
+        (runtime_dir / "manage_booking.py").write_text("old manager\n")
+        (runtime_dir / "run_booking.py").write_text("old runner\n")
+        manage._write_plist(
+            self.plist_path,
+            {"Label": manage.LABEL, "ProgramArguments": ["old"]},
+        )
+        script = """
+import os
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import manage_booking as manage
+state, plist, source = map(Path, sys.argv[2:5])
+def crash(argv, **kwargs):
+    marker = state / manage.SCHEDULER_TRANSACTION_NAME
+    if not marker.is_file():
+        os._exit(88)
+    os._exit(89)
+manage.install_scheduler(source, state, plist, Path(sys.executable), Path('/fake/lark-cli'), crash)
+"""
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(SCRIPTS),
+                str(self.state_dir),
+                str(self.plist_path),
+                str(self.source_dir),
+            ],
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 89)
+        self.assertTrue(
+            (self.state_dir / manage.SCHEDULER_TRANSACTION_NAME).is_file()
+        )
+
+        calls = []
+        result = manage.install_scheduler(
+            self.source_dir,
+            self.state_dir,
+            self.plist_path,
+            Path("/usr/bin/python3"),
+            Path("/opt/homebrew/bin/lark-cli"),
+            lambda argv, **kwargs: (
+                calls.append((argv, kwargs))
+                or mock.Mock(returncode=0, stdout="", stderr="")
+            ),
+        )
+        self.assertEqual(result["status"], "installed")
+        self.assertEqual(
+            (runtime_dir / "manage_booking.py").read_text(), "# manager\n"
+        )
+        self.assertFalse(
+            (self.state_dir / manage.SCHEDULER_TRANSACTION_NAME).exists()
+        )
+        self.assertEqual(list(self.state_dir.glob(".runtime.*")), [])
+        self.assertEqual(
+            list(self.plist_path.parent.glob(f".{self.plist_path.name}.*")),
+            [],
+        )
+        self.assertTrue(calls)
+
+    def test_install_recovers_abrupt_exit_at_each_destructive_boundary(self):
+        script = """
+import os
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+sys.path.insert(0, sys.argv[1])
+import manage_booking as manage
+state, plist, source = map(Path, sys.argv[2:5])
+boundary = sys.argv[5]
+real_replace = manage.os.replace
+real_write = manage._atomic_write_json
+def replace(src, dst):
+    src, dst = Path(src), Path(dst)
+    real_replace(src, dst)
+    hit = (
+        (boundary == 'runtime-backup' and src == state / 'runtime' and dst.name.endswith('.backup'))
+        or (boundary == 'plist-backup' and src == plist and dst.name.endswith('.backup'))
+        or (boundary == 'runtime-live' and dst == state / 'runtime' and src.name.endswith('.new'))
+        or (boundary == 'plist-live' and dst == plist and src.name.endswith('.new'))
+    )
+    if hit:
+        os._exit(94)
+def write(path, payload):
+    real_write(path, payload)
+    if (
+        boundary == 'commit-marker'
+        and path.name == manage.SCHEDULER_TRANSACTION_NAME
+        and payload.get('phase') == 'committed'
+    ):
+        os._exit(95)
+def run(argv, **kwargs):
+    if boundary == 'bootstrap' and argv[1] == 'bootstrap':
+        os._exit(96)
+    return SimpleNamespace(returncode=0, stdout='', stderr='')
+manage.os.replace = replace
+manage._atomic_write_json = write
+manage.install_scheduler(source, state, plist, Path(sys.executable), Path('/fake/lark-cli'), run)
+"""
+        boundaries = (
+            "runtime-backup",
+            "plist-backup",
+            "runtime-live",
+            "plist-live",
+            "bootstrap",
+            "commit-marker",
+        )
+
+        for boundary in boundaries:
+            with self.subTest(boundary=boundary):
+                case_root = self.root / boundary
+                case_state = case_root / "state"
+                case_plist = (
+                    case_root
+                    / "LaunchAgents"
+                    / f"{manage.LABEL}.plist"
+                )
+                runtime = case_state / "runtime"
+                runtime.mkdir(parents=True)
+                (runtime / "manage_booking.py").write_text("old manager\n")
+                (runtime / "run_booking.py").write_text("old runner\n")
+                manage._write_plist(
+                    case_plist,
+                    {"Label": manage.LABEL, "ProgramArguments": ["old"]},
+                )
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        script,
+                        str(SCRIPTS),
+                        str(case_state),
+                        str(case_plist),
+                        str(self.source_dir),
+                        boundary,
+                    ],
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                )
+                self.assertIn(completed.returncode, {94, 95, 96})
+
+                result = manage.install_scheduler(
+                    self.source_dir,
+                    case_state,
+                    case_plist,
+                    Path("/usr/bin/python3"),
+                    Path("/opt/homebrew/bin/lark-cli"),
+                    lambda argv, **kwargs: mock.Mock(
+                        returncode=0, stdout="", stderr=""
+                    ),
+                )
+                self.assertEqual(result["status"], "installed")
+                self.assertEqual(
+                    (runtime / "manage_booking.py").read_text(),
+                    "# manager\n",
+                )
+                self.assertEqual(list(case_state.glob(".runtime.*")), [])
+                self.assertEqual(
+                    list(case_plist.parent.glob(f".{case_plist.name}.*")),
+                    [],
+                )
+                self.assertFalse(
+                    (case_state / manage.SCHEDULER_TRANSACTION_NAME).exists()
+                )
+
+    def test_uninstall_recovers_after_abrupt_exit_during_bootout(self):
+        runtime_dir = self.state_dir / "runtime"
+        runtime_dir.mkdir(parents=True)
+        (runtime_dir / "run_booking.py").write_text("runner\n")
+        manage.create_plan(
+            self.state_dir,
+            manage.validate_ranges(["10:00-11:00", "15:00-16:00"]),
+            datetime(2026, 7, 13, 20, 0, tzinfo=TZ),
+        )
+        manage._write_plist(
+            self.plist_path,
+            {"Label": manage.LABEL, "ProgramArguments": ["runner"]},
+        )
+        script = """
+import os
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import manage_booking as manage
+state, plist = map(Path, sys.argv[2:4])
+def crash(argv, **kwargs):
+    marker = state / manage.SCHEDULER_TRANSACTION_NAME
+    if not marker.is_file():
+        os._exit(88)
+    os._exit(89)
+manage.uninstall_scheduler(state, plist, crash)
+"""
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(SCRIPTS),
+                str(self.state_dir),
+                str(self.plist_path),
+            ],
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 89)
+
+        result = manage.uninstall_scheduler(
+            self.state_dir,
+            self.plist_path,
+            lambda argv, **kwargs: mock.Mock(
+                returncode=0, stdout="", stderr=""
+            ),
+        )
+        self.assertEqual(result["status"], "uninstalled")
+        self.assertFalse(runtime_dir.exists())
+        self.assertFalse(self.plist_path.exists())
+        self.assertFalse(manage.plan_path(self.state_dir).exists())
+        self.assertFalse(
+            (self.state_dir / manage.SCHEDULER_TRANSACTION_NAME).exists()
+        )
+
+    def test_uninstall_recovers_abrupt_exit_at_each_removal_boundary(self):
+        script = """
+import os
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+sys.path.insert(0, sys.argv[1])
+import manage_booking as manage
+state, plist = map(Path, sys.argv[2:4])
+boundary = sys.argv[4]
+target = {
+    'plist': plist,
+    'plan': manage.plan_path(state),
+    'runtime': state / 'runtime',
+}[boundary]
+real_remove = manage._remove_path
+def remove(path):
+    real_remove(path)
+    if Path(path) == target:
+        os._exit(97)
+manage._remove_path = remove
+manage.uninstall_scheduler(
+    state,
+    plist,
+    lambda argv, **kwargs: SimpleNamespace(returncode=0, stdout='', stderr=''),
+)
+"""
+
+        for boundary in ("plist", "plan", "runtime"):
+            with self.subTest(boundary=boundary):
+                case_root = self.root / f"uninstall-{boundary}"
+                case_state = case_root / "state"
+                case_plist = (
+                    case_root
+                    / "LaunchAgents"
+                    / f"{manage.LABEL}.plist"
+                )
+                runtime = case_state / "runtime"
+                runtime.mkdir(parents=True)
+                (runtime / "run_booking.py").write_text("runner\n")
+                manage.create_plan(
+                    case_state,
+                    manage.validate_ranges(
+                        ["10:00-11:00", "15:00-16:00"]
+                    ),
+                    datetime(2026, 7, 13, 20, 0, tzinfo=TZ),
+                )
+                manage._write_plist(
+                    case_plist,
+                    {"Label": manage.LABEL, "ProgramArguments": ["runner"]},
+                )
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        script,
+                        str(SCRIPTS),
+                        str(case_state),
+                        str(case_plist),
+                        boundary,
+                    ],
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                )
+                self.assertEqual(completed.returncode, 97)
+
+                result = manage.uninstall_scheduler(
+                    case_state,
+                    case_plist,
+                    lambda argv, **kwargs: mock.Mock(
+                        returncode=0, stdout="", stderr=""
+                    ),
+                )
+                self.assertEqual(result["status"], "uninstalled")
+                self.assertFalse(runtime.exists())
+                self.assertFalse(case_plist.exists())
+                self.assertFalse(manage.plan_path(case_state).exists())
+                self.assertFalse(
+                    (case_state / manage.SCHEDULER_TRANSACTION_NAME).exists()
+                )
+
+    def test_install_and_uninstall_use_runner_state_lock(self):
+        entered = []
+
+        @contextlib.contextmanager
+        def tracked_lock(state_dir):
+            entered.append(state_dir)
+            yield
+
+        ok = lambda argv, **kwargs: mock.Mock(
+            returncode=0, stdout="", stderr=""
+        )
+        with mock.patch.object(manage, "locked_state", tracked_lock):
+            manage.install_scheduler(
+                self.source_dir,
+                self.state_dir,
+                self.plist_path,
+                Path("/usr/bin/python3"),
+                Path("/opt/homebrew/bin/lark-cli"),
+                ok,
+            )
+            manage.uninstall_scheduler(self.state_dir, self.plist_path, ok)
+
+        self.assertEqual(entered, [self.state_dir, self.state_dir])
+
     def test_management_cli_exposes_required_commands(self):
         parser = manage.build_parser()
         common = ["--state-dir", str(self.state_dir)]
@@ -579,6 +1071,35 @@ class SchedulerTests(unittest.TestCase):
         )
         self.assertEqual(created.command, "create")
         self.assertEqual(created.slot, ["10:00-11:00", "15:00-16:00"])
+
+    def test_create_cli_rejects_now_override(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                manage.build_parser().parse_args(
+                    [
+                        "--state-dir",
+                        str(self.state_dir),
+                        "create",
+                        "--slot",
+                        "10:00-11:00",
+                        "--slot",
+                        "15:00-16:00",
+                        "--now",
+                        "2026-07-13T20:00:00+08:00",
+                    ]
+                )
+
+    def test_launchctl_timeout_is_finite_and_reported(self):
+        def timeout(argv, **kwargs):
+            self.assertEqual(kwargs["timeout"], manage.LAUNCHCTL_TIMEOUT)
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+        with self.assertRaisesRegex(RuntimeError, "timed out"):
+            manage.uninstall_scheduler(
+                self.state_dir,
+                self.plist_path,
+                timeout,
+            )
 
     def test_status_cli_emits_json_without_external_commands(self):
         output = io.StringIO()
@@ -2047,6 +2568,26 @@ class ExecutionPersistenceTests(unittest.TestCase):
             lambda: self.now,
             lambda seconds: self.fail("unexpected sleep"),
             lambda result: self.fail("unexpected notification"),
+        )
+
+        self.assertEqual(result, {"status": "idle"})
+        self.assertTrue(manage.plan_path(self.state_dir).exists())
+
+    def test_poll_before_0859_is_local_idle_check_without_sleep_or_auth(self):
+        case = self
+
+        class NoExternalClient:
+            def auth_status(self):
+                case.fail("authentication must not run before polling window")
+
+        early = datetime(2026, 7, 14, 0, 1, tzinfo=TZ)
+        result = runner.execute_due_plan(
+            self.state_dir,
+            early,
+            NoExternalClient(),
+            lambda: early,
+            lambda seconds: self.fail("early poll must not sleep"),
+            lambda result: self.fail("early poll must not notify"),
         )
 
         self.assertEqual(result, {"status": "idle"})

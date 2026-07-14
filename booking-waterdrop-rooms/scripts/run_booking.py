@@ -616,7 +616,10 @@ def execute_due_plan(
     notifier,
 ) -> dict:
     with manage.locked_state(state_dir):
-        plan = manage.load_plan(state_dir)
+        try:
+            plan = manage.load_plan(state_dir)
+        except ValueError as exc:
+            raise LarkError("invalid plan state", "fatal") from exc
         if not plan:
             return {"status": "idle"}
         validate_plan_for_execution(plan)
@@ -630,6 +633,13 @@ def execute_due_plan(
         if local_date < execution_date or (
             local_date > execution_date and not has_uncertain
         ):
+            return {"status": "idle"}
+        poll_window = datetime.combine(
+            execution_date,
+            time(8, 59),
+            TZ,
+        )
+        if local_date == execution_date and now.astimezone(TZ) < poll_window:
             return {"status": "idle"}
 
         persistence_lock = threading.Lock()
