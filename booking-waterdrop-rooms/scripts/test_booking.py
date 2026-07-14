@@ -2750,6 +2750,34 @@ class RunnerExceptionBoundaryTests(unittest.TestCase):
 
 
 class RoomRankingTests(unittest.TestCase):
+    def test_live_room_names_with_capacity_suffix_keep_fixed_priority(self):
+        payload = {
+            "ok": True,
+            "identity": "user",
+            "data": {
+                "time_slots": [{
+                    "start": "2026-07-16T10:00:00+08:00",
+                    "end": "2026-07-16T10:30:00+08:00",
+                    "meeting_rooms": [
+                        {"room_id": "omm_706", "room_name": "水滴大厦-7F-706(6)", "capacity": 6},
+                        {"room_id": "omm_805", "room_name": "水滴大厦-8F-805(14)", "capacity": 14},
+                        {"room_id": "omm_703", "room_name": "水滴大厦-7F-703(10)", "capacity": 10},
+                        {"room_id": "omm_704", "room_name": "水滴大厦-7F-704(10)", "capacity": 10},
+                    ],
+                }],
+            },
+        }
+        rooms = [
+            room
+            for record in runner.collect_room_records(payload)
+            if (room := runner.normalize_room(record))
+        ]
+        self.assertTrue(all(room.building == "水滴大厦" for room in rooms))
+        self.assertEqual(
+            [room.room_id for room in runner.rank_rooms(rooms)],
+            ["omm_703", "omm_704", "omm_706", "omm_805"],
+        )
+
     def test_collects_nested_room_records_in_api_order(self):
         payload = {
             "ok": True,

@@ -822,7 +822,8 @@ class Room:
     @property
     def short_name(self) -> str:
         marker = f"{BUILDING}-"
-        return self.room_name.split(marker, 1)[-1]
+        value = self.room_name.split(marker, 1)[-1]
+        return re.sub(r"\(\d+\)$", "", value)
 
 
 def collect_room_records(payload: object) -> list[dict]:
