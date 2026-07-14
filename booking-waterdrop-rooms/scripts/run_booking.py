@@ -479,6 +479,36 @@ def reserve_slot(
     return {**slot, "status": "failed", "error": last_error}
 
 
+def _aggregate_slot_status(slots: Sequence[dict]) -> str:
+    statuses = [slot.get("status") for slot in slots]
+    successes = statuses.count("success")
+    if successes == 2:
+        return "success"
+    if successes == 1:
+        return "partial"
+    if statuses and set(statuses) == {"missed"}:
+        return "missed"
+    return "failed"
+
+
+def _settle_missed_plan(plan: dict) -> dict:
+    slots = [
+        {
+            **slot,
+            "status": "missed",
+            "error": "execution window missed",
+        }
+        if slot.get("status") == "pending"
+        else dict(slot)
+        for slot in plan["slots"]
+    ]
+    return {
+        **plan,
+        "status": _aggregate_slot_status(slots),
+        "slots": slots,
+    }
+
+
 def execute_plan_in_memory(
     plan: dict,
     client,
@@ -514,34 +544,12 @@ def execute_plan_in_memory(
                     )
                 else:
                     ordered.append(dict(slot))
-            successes = sum(
-                slot["status"] == "success" for slot in ordered
-            )
-            if successes == 2:
-                status = "success"
-            elif successes == 1:
-                status = "partial"
-            else:
-                status = "failed"
-            return {**plan, "status": status, "slots": ordered}
-        return {
-            **plan,
-            "status": "missed",
-            "slots": [
-                {
-                    **slot,
-                    "status": "missed",
-                    "error": "execution window missed",
-                }
-                if slot.get("status") not in {
-                    "success",
-                    "uncertain",
-                    "failed",
-                }
-                else slot
-                for slot in plan["slots"]
-            ],
-        }
+            return {
+                **plan,
+                "status": _aggregate_slot_status(ordered),
+                "slots": ordered,
+            }
+        return _settle_missed_plan(plan)
     if current < start:
         sleeper((start - current).total_seconds())
     pending = [
@@ -577,14 +585,11 @@ def execute_plan_in_memory(
         for slot_id, future in futures.items():
             results[slot_id] = future.result()
     ordered = [results[slot["slot_id"]] for slot in plan["slots"]]
-    successes = sum(slot["status"] == "success" for slot in ordered)
-    if successes == 2:
-        status = "success"
-    elif successes == 1:
-        status = "partial"
-    else:
-        status = "failed"
-    return {**plan, "status": status, "slots": ordered}
+    return {
+        **plan,
+        "status": _aggregate_slot_status(ordered),
+        "slots": ordered,
+    }
 
 
 def execute_due_plan(
@@ -609,9 +614,7 @@ def execute_due_plan(
             slot.get("status") == "uncertain"
             for slot in plan["slots"]
         )
-        if local_date < execution_date or (
-            local_date > execution_date and not has_uncertain
-        ):
+        if local_date < execution_date:
             return {"status": "idle"}
         poll_window = datetime.combine(
             execution_date,
@@ -631,40 +634,41 @@ def execute_due_plan(
                         break
                 manage._atomic_write_json(manage.plan_path(state_dir), plan)
 
-        try:
-            client.auth_status()
-            result = execute_plan_in_memory(
-                plan,
-                client,
-                clock,
-                sleeper,
-                on_slot_success=persist_slot,
-                on_slot_uncertain=persist_slot,
-            )
-        except LarkError as exc:
-            reason = safe_error(exc)
-            failed_slots = [
-                slot
-                if slot.get("status")
-                in {"success", "uncertain", "failed"}
-                else {**slot, "status": "failed", "error": reason}
-                for slot in plan["slots"]
-            ]
-            successes = sum(
-                slot.get("status") == "success"
-                for slot in failed_slots
-            )
-            result = {
-                **plan,
-                "status": (
-                    "success"
-                    if successes == 2
-                    else "partial"
-                    if successes == 1
-                    else "failed"
-                ),
-                "slots": failed_slots,
-            }
+        deadline = datetime.combine(
+            execution_date,
+            time(9, 0, 30),
+            TZ,
+        )
+        local_now = now.astimezone(TZ)
+        if not has_uncertain and (
+            local_date > execution_date or local_now > deadline
+        ):
+            result = _settle_missed_plan(plan)
+        else:
+            try:
+                client.auth_status()
+                result = execute_plan_in_memory(
+                    plan,
+                    client,
+                    clock,
+                    sleeper,
+                    on_slot_success=persist_slot,
+                    on_slot_uncertain=persist_slot,
+                )
+            except LarkError as exc:
+                reason = safe_error(exc)
+                failed_slots = [
+                    slot
+                    if slot.get("status")
+                    in {"success", "uncertain", "failed"}
+                    else {**slot, "status": "failed", "error": reason}
+                    for slot in plan["slots"]
+                ]
+                result = {
+                    **plan,
+                    "status": _aggregate_slot_status(failed_slots),
+                    "slots": failed_slots,
+                }
         result["completed_at"] = clock().isoformat()
         unresolved = any(
             slot.get("status") == "uncertain"
@@ -1109,6 +1113,7 @@ class LarkClient:
         protocol_kind: str = "fatal",
         transport_kind: str = "transient",
         unknown_error_kind: str = "fatal",
+        identity_kind: str = "fatal",
     ) -> dict:
         try:
             result = self.run_command(
@@ -1163,13 +1168,18 @@ class LarkClient:
                 error.get("status"),
             )
             raise LarkError(message, kind)
-        if payload.get("identity") not in (None, "user"):
-            raise LarkError("lark-cli did not use user identity")
+        if payload.get("identity") != "user":
+            raise LarkError(
+                "lark-cli did not use user identity",
+                identity_kind,
+            )
         return payload
 
     def auth_status(self) -> None:
         payload = self._json(["auth", "status", "--json", "--verify"])
-        data = payload.get("data", payload)
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            raise LarkError("lark-cli returned malformed auth data", "fatal")
         identity = data.get("identity") or payload.get("identity")
         verified = data.get("verified")
         if identity != "user" or verified is not True:
@@ -1223,6 +1233,7 @@ class LarkClient:
                 protocol_kind="ambiguous",
                 transport_kind="ambiguous",
                 unknown_error_kind="ambiguous",
+                identity_kind="ambiguous",
             )
         except LarkError as exc:
             if exc.kind in {"transient", "ambiguous"}:
@@ -1323,27 +1334,63 @@ def _best_effort_report(state_dir: Path, result: dict) -> None:
         pass
 
 
-def _run_main(args: argparse.Namespace) -> int:
-    binary = os.environ.get("LARK_CLI_BIN") or shutil.which("lark-cli")
-    if not binary:
-        result = {
-            "status": "failed",
-            "slots": [],
-            "error": "lark-cli missing",
-        }
-        notify_result(result)
-        append_log(
-            args.state_dir / "logs",
-            datetime.now(TZ),
-            {
-                "stage": "preflight",
-                "status": "failed",
-                "error": "lark-cli missing",
-            },
-        )
-        return 2
+class _DeferredLarkClient:
+    def __init__(self):
+        self._client: LarkClient | None = None
 
-    client = LarkClient(Path(binary))
+    @property
+    def resolved(self) -> bool:
+        return self._client is not None
+
+    def _get(self) -> LarkClient:
+        if self._client is None:
+            binary = os.environ.get("LARK_CLI_BIN") or shutil.which(
+                "lark-cli"
+            )
+            if not binary:
+                raise LarkError("lark-cli missing", "fatal")
+            self._client = LarkClient(Path(binary))
+        return self._client
+
+    @property
+    def binary(self) -> Path:
+        return self._get().binary
+
+    @property
+    def update_notice(self) -> bool:
+        return bool(
+            self._client is not None and self._client.update_notice
+        )
+
+    def auth_status(self) -> None:
+        return self._get().auth_status()
+
+    def room_find(self, start_iso: str, end_iso: str) -> list[Room]:
+        return self._get().room_find(start_iso, end_iso)
+
+    def create_event(
+        self,
+        start_iso: str,
+        end_iso: str,
+        room_id: str,
+    ) -> str:
+        return self._get().create_event(start_iso, end_iso, room_id)
+
+    def find_matching_event(
+        self,
+        start_iso: str,
+        end_iso: str,
+        room_id: str,
+    ) -> str | None:
+        return self._get().find_matching_event(
+            start_iso,
+            end_iso,
+            room_id,
+        )
+
+
+def _run_main(args: argparse.Namespace) -> int:
+    client = _DeferredLarkClient()
     result = execute_due_plan(
         args.state_dir,
         datetime.now(TZ),
@@ -1352,7 +1399,7 @@ def _run_main(args: argparse.Namespace) -> int:
         time_module.sleep,
         notify_result,
     )
-    update = perform_deferred_update(client)
+    update = perform_deferred_update(client) if client.resolved else None
     if update:
         _persist_update_result(args.state_dir, update)
         append_log(

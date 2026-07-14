@@ -2388,6 +2388,30 @@ class ExecutionConcurrencyTests(unittest.TestCase):
         self.assertEqual(result["status"], "missed")
         self.assertEqual(client.created, [])
 
+    def test_start_after_deadline_preserves_success_and_reports_partial(self):
+        plan = self.make_plan()
+        plan["slots"][0].update(
+            status="success",
+            room_id="omm_703",
+            room_name="水滴大厦-7F-703",
+            event_id="evt_existing",
+        )
+        fixed_now = datetime(2026, 7, 14, 9, 0, 31, tzinfo=TZ)
+
+        result = runner.execute_plan_in_memory(
+            plan,
+            object(),
+            lambda: fixed_now,
+            lambda seconds: self.fail("unexpected sleep"),
+        )
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(
+            [slot["status"] for slot in result["slots"]],
+            ["success", "missed"],
+        )
+        self.assertEqual(result["slots"][0]["event_id"], "evt_existing")
+
     def test_two_slots_start_concurrently_and_may_reuse_room(self):
         barrier = threading.Barrier(2)
         room = runner.Room(
@@ -2834,6 +2858,119 @@ class ExecutionPersistenceTests(unittest.TestCase):
         self.assertEqual(result, {"status": "idle"})
         self.assertTrue(manage.plan_path(self.state_dir).exists())
 
+    def test_stale_pending_plan_settles_locally_once(self):
+        class NoExternalClient:
+            def auth_status(self):
+                raise AssertionError(
+                    "stale settlement must not authenticate"
+                )
+
+        notifications = []
+        stale_now = datetime(2026, 7, 15, 9, 0, tzinfo=TZ)
+
+        first = runner.execute_due_plan(
+            self.state_dir,
+            stale_now,
+            NoExternalClient(),
+            lambda: stale_now,
+            lambda seconds: self.fail("stale settlement must not sleep"),
+            lambda result: notifications.append(result["status"]),
+        )
+        second = runner.execute_due_plan(
+            self.state_dir,
+            stale_now,
+            NoExternalClient(),
+            lambda: stale_now,
+            lambda seconds: self.fail("idle runner must not sleep"),
+            lambda result: self.fail("settled plan must not notify twice"),
+        )
+
+        history = manage.latest_result(self.state_dir)
+        log_lines = (
+            self.state_dir / "logs" / "2026-07-15.jsonl"
+        ).read_text().splitlines()
+        self.assertEqual(first["status"], "missed")
+        self.assertEqual(
+            [slot["status"] for slot in first["slots"]],
+            ["missed", "missed"],
+        )
+        self.assertEqual(second, {"status": "idle"})
+        self.assertEqual(notifications, ["missed"])
+        self.assertEqual(len(log_lines), 1)
+        self.assertEqual(history, first)
+        self.assertIsNone(manage.load_plan(self.state_dir))
+
+    def test_stale_settlement_preserves_terminal_slots_truthfully(self):
+        cases = {
+            "one success": ("success", "partial"),
+            "one failure": ("failed", "failed"),
+        }
+
+        for case, (terminal_status, expected_status) in cases.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                state_dir = Path(directory) / "state"
+                plan = json.loads(json.dumps(self.plan))
+                if terminal_status == "success":
+                    plan["slots"][0].update(
+                        status="success",
+                        room_id="omm_703",
+                        room_name="水滴大厦-7F-703",
+                        event_id="evt_existing",
+                    )
+                else:
+                    plan["slots"][0].update(
+                        status="failed",
+                        error="non-retryable Feishu error",
+                    )
+                manage._atomic_write_json(manage.plan_path(state_dir), plan)
+                stale_now = datetime(2026, 7, 15, 9, 0, tzinfo=TZ)
+
+                result = runner.execute_due_plan(
+                    state_dir,
+                    stale_now,
+                    object(),
+                    lambda: stale_now,
+                    lambda seconds: self.fail("stale settlement must not sleep"),
+                    lambda result: None,
+                )
+
+                self.assertEqual(result["status"], expected_status)
+                self.assertEqual(result["slots"][0]["status"], terminal_status)
+                self.assertEqual(result["slots"][1]["status"], "missed")
+                self.assertEqual(manage.latest_result(state_dir), result)
+                self.assertIsNone(manage.load_plan(state_dir))
+
+    def test_cutoff_settlement_is_local_and_truthfully_partial(self):
+        self.plan["slots"][0].update(
+            status="success",
+            room_id="omm_703",
+            room_name="水滴大厦-7F-703",
+            event_id="evt_existing",
+        )
+        manage._atomic_write_json(manage.plan_path(self.state_dir), self.plan)
+        cutoff = datetime(2026, 7, 14, 9, 0, 31, tzinfo=TZ)
+
+        class NoExternalClient:
+            def auth_status(self):
+                raise AssertionError("cutoff settlement must not authenticate")
+
+        result = runner.execute_due_plan(
+            self.state_dir,
+            cutoff,
+            NoExternalClient(),
+            lambda: cutoff,
+            lambda seconds: self.fail("cutoff settlement must not sleep"),
+            lambda result: None,
+        )
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(
+            [slot["status"] for slot in result["slots"]],
+            ["success", "missed"],
+        )
+        self.assertEqual(manage.latest_result(self.state_dir), result)
+        self.assertIsNone(manage.load_plan(self.state_dir))
+
 
 class NotificationUpdateTests(unittest.TestCase):
     def test_booking_notification_uses_argv_and_status_summary(self):
@@ -3035,37 +3172,109 @@ class RunnerCliTests(unittest.TestCase):
         parsed = parser.parse_args(["--state-dir", "/tmp/booking-state"])
         self.assertEqual(parsed.state_dir, Path("/tmp/booking-state"))
 
-    def test_missing_lark_cli_notifies_logs_and_returns_2(self):
-        calls = []
+    def test_idle_polls_do_not_discover_or_require_lark_cli(self):
+        fixed_values = {
+            "empty": datetime(2026, 7, 14, 9, 0, tzinfo=TZ),
+            "future": datetime(2026, 7, 14, 9, 0, tzinfo=TZ),
+            "before polling window": datetime(
+                2026, 7, 14, 8, 58, 59, tzinfo=TZ
+            ),
+        }
+
+        for case, fixed_now in fixed_values.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                state_dir = Path(directory) / "state"
+                if case != "empty":
+                    plan = PlanValidationSecurityTests().make_plan()
+                    if case == "future":
+                        plan.update(
+                            execution_date="2026-07-15",
+                            target_date="2026-07-17",
+                        )
+                    manage._atomic_write_json(
+                        manage.plan_path(state_dir), plan
+                    )
+
+                class FixedDateTime(datetime):
+                    @classmethod
+                    def now(cls, tz=None):
+                        return fixed_now
+
+                with (
+                    mock.patch.dict(os.environ, {}, clear=True),
+                    mock.patch.object(runner, "datetime", FixedDateTime),
+                    mock.patch.object(
+                        runner.shutil, "which", return_value=None
+                    ) as which,
+                    mock.patch.object(runner, "LarkClient") as client,
+                    mock.patch.object(runner, "notify_result") as notify,
+                    mock.patch.object(runner, "append_log") as log,
+                    mock.patch.object(
+                        runner, "perform_deferred_update"
+                    ) as update,
+                ):
+                    exit_code = runner.main(
+                        ["--state-dir", str(state_dir)]
+                    )
+
+                self.assertEqual(exit_code, 0)
+                which.assert_not_called()
+                client.assert_not_called()
+                notify.assert_not_called()
+                log.assert_not_called()
+                update.assert_not_called()
+                if case != "empty":
+                    self.assertIsNotNone(manage.load_plan(state_dir))
+
+    def test_actionable_plan_without_lark_cli_fails_once_and_settles(self):
+        fixed_now = datetime(2026, 7, 14, 9, 0, tzinfo=TZ)
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now
+
         with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory) / "state"
+            manage._atomic_write_json(
+                manage.plan_path(state_dir),
+                PlanValidationSecurityTests().make_plan(),
+            )
+            notifications = []
+            logs = []
             with (
                 mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch.object(runner, "datetime", FixedDateTime),
                 mock.patch.object(runner.shutil, "which", return_value=None),
                 mock.patch.object(
                     runner,
                     "notify_result",
-                    side_effect=lambda result: calls.append(
-                        ("notify", result["error"])
-                    ),
+                    side_effect=lambda result: notifications.append(result),
                 ),
                 mock.patch.object(
                     runner,
                     "append_log",
-                    side_effect=lambda log_dir, now, record: calls.append(
-                        ("log", record["error"])
-                    ),
+                    side_effect=lambda log_dir, now, record: logs.append(record),
                 ),
+                mock.patch.object(
+                    runner, "perform_deferred_update"
+                ) as update,
             ):
-                exit_code = runner.main(["--state-dir", directory])
+                exit_code = runner.main(
+                    ["--state-dir", str(state_dir)]
+                )
 
-        self.assertEqual(exit_code, 2)
+            history = manage.latest_result(state_dir)
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual([item["status"] for item in notifications], ["failed"])
+        self.assertEqual([item["stage"] for item in logs], ["completed"])
+        self.assertEqual(history["status"], "failed")
         self.assertEqual(
-            calls,
-            [
-                ("notify", "lark-cli missing"),
-                ("log", "lark-cli missing"),
-            ],
+            [slot["error"] for slot in history["slots"]],
+            ["non-retryable Feishu error", "non-retryable Feishu error"],
         )
+        update.assert_not_called()
 
     def test_update_is_deferred_until_after_booking_notification(self):
         calls = []
@@ -3074,10 +3283,14 @@ class RunnerCliTests(unittest.TestCase):
             binary = Path("/fake/lark-cli")
             update_notice = True
 
+            def auth_status(self):
+                return None
+
         def fake_execute(
             state_dir, now, client, clock, sleeper, notifier
         ):
             calls.append("execute")
+            client.auth_status()
             notifier({"status": "partial"})
             return {"status": "partial"}
 
@@ -3150,9 +3363,13 @@ class RunnerCliTests(unittest.TestCase):
             binary = Path("/fake/lark-cli")
             update_notice = True
 
+            def auth_status(self):
+                return None
+
         def fake_execute(
             state_dir, now, client, clock, sleeper, notifier
         ):
+            client.auth_status()
             notifier({"status": "success"})
             return {"status": "success"}
 
@@ -3218,6 +3435,15 @@ class RunnerCliTests(unittest.TestCase):
             binary = Path("/fake/lark-cli")
             update_notice = True
 
+            def auth_status(self):
+                return None
+
+        def failed_execution(
+            state_dir, now, client, clock, sleeper, notifier
+        ):
+            client.auth_status()
+            return {"status": "failed"}
+
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
             manage._atomic_write_json(
@@ -3237,7 +3463,7 @@ class RunnerCliTests(unittest.TestCase):
                 mock.patch.object(
                     runner,
                     "execute_due_plan",
-                    return_value={"status": "failed"},
+                    side_effect=failed_execution,
                 ),
                 mock.patch.object(
                     runner,
@@ -3318,6 +3544,19 @@ class RunnerCliTests(unittest.TestCase):
                 "error": "interactive approval is required for lark-cli update",
             }
 
+        class MainClient:
+            update_notice = True
+            binary = Path("/fake/lark-cli")
+
+            def auth_status(self):
+                return None
+
+        def completed_execution(
+            state_dir, now, client, clock, sleeper, notifier
+        ):
+            client.auth_status()
+            return {"status": "success"}
+
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
             with (
@@ -3326,11 +3565,13 @@ class RunnerCliTests(unittest.TestCase):
                     {"LARK_CLI_BIN": "/fake/lark-cli"},
                     clear=True,
                 ),
-                mock.patch.object(runner, "LarkClient", return_value=object()),
+                mock.patch.object(
+                    runner, "LarkClient", return_value=MainClient()
+                ),
                 mock.patch.object(
                     runner,
                     "execute_due_plan",
-                    return_value={"status": "idle"},
+                    side_effect=completed_execution,
                 ),
                 mock.patch.object(
                     runner,
@@ -3496,9 +3737,17 @@ class RunnerExceptionBoundaryTests(unittest.TestCase):
     def test_unexpected_update_exception_does_not_escape(self):
         notifications = []
 
+        class MainClient:
+            update_notice = True
+            binary = Path("/fake/lark-cli")
+
+            def auth_status(self):
+                return None
+
         def completed_execution(
             state_dir, now, client, clock, sleeper, notifier
         ):
+            client.auth_status()
             result = {"status": "success", "slots": []}
             notifier(result)
             return result
@@ -3510,7 +3759,9 @@ class RunnerExceptionBoundaryTests(unittest.TestCase):
                     {"LARK_CLI_BIN": "/fake/lark-cli"},
                     clear=True,
                 ),
-                mock.patch.object(runner, "LarkClient", return_value=object()),
+                mock.patch.object(
+                    runner, "LarkClient", return_value=MainClient()
+                ),
                 mock.patch.object(
                     runner,
                     "execute_due_plan",
@@ -3701,6 +3952,157 @@ class RoomRankingTests(unittest.TestCase):
 
 
 class LarkCommandTests(unittest.TestCase):
+    def test_read_success_envelopes_require_explicit_user_identity(self):
+        start = "2026-07-16T10:00:00+08:00"
+        end = "2026-07-16T11:00:00+08:00"
+        cases = ("room-find", "search", "get")
+
+        for case in cases:
+            with self.subTest(case=case):
+                calls = []
+
+                def fake_run(argv, **kwargs):
+                    calls.append(argv)
+                    if case == "get" and "+search-event" in argv:
+                        payload = {
+                            "ok": True,
+                            "identity": "user",
+                            "data": {
+                                "events": [
+                                    {
+                                        "event_id": "evt_match",
+                                        "start": start,
+                                        "end": end,
+                                    }
+                                ]
+                            },
+                        }
+                    elif case == "room-find":
+                        payload = {"ok": True, "data": {"rooms": []}}
+                    else:
+                        payload = {"ok": True, "data": {"events": []}}
+                    return mock.Mock(
+                        returncode=0,
+                        stdout=json.dumps(payload),
+                        stderr="",
+                    )
+
+                client = runner.LarkClient(Path("lark-cli"), fake_run)
+                with self.assertRaises(runner.LarkError) as caught:
+                    if case == "room-find":
+                        client.room_find(start, end)
+                    else:
+                        client.find_matching_event(start, end, "omm_703")
+
+                self.assertEqual(caught.exception.kind, "fatal")
+                self.assertIn(
+                    "+get" if case == "get" else "+room-find"
+                    if case == "room-find"
+                    else "+search-event",
+                    calls[-1],
+                )
+
+    def test_create_success_requires_user_identity_as_ambiguous(self):
+        for identity in (None, "bot"):
+            with self.subTest(identity=identity):
+                payload = {
+                    "ok": True,
+                    "data": {"event_id": "evt_maybe_created"},
+                }
+                if identity is not None:
+                    payload["identity"] = identity
+                client = runner.LarkClient(
+                    Path("lark-cli"),
+                    lambda argv, payload=payload, **kwargs: mock.Mock(
+                        returncode=0,
+                        stdout=json.dumps(payload),
+                        stderr="",
+                    ),
+                )
+
+                with self.assertRaises(runner.LarkError) as caught:
+                    client.create_event(
+                        "2026-07-16T10:00:00+08:00",
+                        "2026-07-16T11:00:00+08:00",
+                        "omm_703",
+                    )
+
+                self.assertEqual(caught.exception.kind, "ambiguous")
+
+    def test_create_success_without_identity_never_submits_again(self):
+        create_calls = 0
+
+        def fake_run(argv, **kwargs):
+            nonlocal create_calls
+            if "+room-find" in argv:
+                payload = {
+                    "ok": True,
+                    "identity": "user",
+                    "data": {
+                        "rooms": [
+                            {
+                                "room_id": "omm_703",
+                                "room_name": "水滴大厦-7F-703",
+                                "building_name": "水滴大厦",
+                            }
+                        ]
+                    },
+                }
+            elif "+create" in argv:
+                create_calls += 1
+                payload = {
+                    "ok": True,
+                    "data": {"event_id": "evt_maybe_created"},
+                }
+            else:
+                payload = {
+                    "ok": True,
+                    "identity": "user",
+                    "data": {"events": []},
+                }
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps(payload),
+                stderr="",
+            )
+
+        client = runner.LarkClient(Path("lark-cli"), fake_run)
+        fixed_now = datetime(2026, 7, 14, 9, 0, tzinfo=TZ)
+        plan = ExecutionRetryTests().make_plan()
+        result = runner.reserve_slot(
+            plan,
+            plan["slots"][0],
+            client,
+            fixed_now,
+            lambda: fixed_now,
+            lambda seconds: self.fail("recovery must not sleep at deadline"),
+        )
+
+        self.assertEqual(result["status"], "uncertain")
+        self.assertEqual(create_calls, 1)
+
+    def test_auth_status_rejects_non_object_data_as_fatal_lark_error(self):
+        for data in (None, [], "verified"):
+            with self.subTest(data=data):
+                payload = {
+                    "ok": True,
+                    "identity": "user",
+                    "data": data,
+                }
+                client = runner.LarkClient(
+                    Path("lark-cli"),
+                    lambda argv, payload=payload, **kwargs: mock.Mock(
+                        returncode=0,
+                        stdout=json.dumps(payload),
+                        stderr="",
+                    ),
+                )
+
+                with self.assertRaises(runner.LarkError) as caught:
+                    client.auth_status()
+
+                self.assertEqual(caught.exception.kind, "fatal")
+
     def test_create_structured_429_code_or_status_is_safe_retry(self):
         cases = (
             ("code", 429, "safe_retry"),
