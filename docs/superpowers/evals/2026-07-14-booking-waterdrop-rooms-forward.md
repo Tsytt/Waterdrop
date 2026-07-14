@@ -5,7 +5,7 @@
 - Evaluation date: 2026-07-14
 - Skill path: `booking-waterdrop-rooms/`
 - External writes allowed: no
-- Unit tests: pass (`104` tests)
+- Unit tests: pass (`132` tests)
 - Skill validation: pass (`Skill is valid!`)
 - Skill length: `425` words
 - Python compilation: pass for `run_booking.py`, `manage_booking.py`, and `test_booking.py`
@@ -363,6 +363,11 @@ Verdict: **PASS**. Violated invariant: none. The due attempt is terminal, user-o
 
 ## Final Verdict
 
-**READY.** The completed Skill and runtime satisfy every scored behavioral invariant. The five valid normal samples converged (`5/5`), all four targeted boundary samples passed (`4/4`), the deterministic suite passed all `104` tests, structural validation passed, and the redacted live room shape is covered by the reviewed regression fix in `08896b3`.
+After the initial forward evaluation, the whole-branch release review found additional local-state and unattended-runner boundary defects that the behavior samples did not exercise. They were resolved before this final verdict:
+
+- `6575567` and `e7762df` added recoverable cancellation/install/uninstall transactions, shared lifecycle locking, timezone-independent 15-second polling, strict management-state validation, and directory-bound history operations. Task 8 then passed an independent review with no Critical, Important, or Minor findings.
+- `20654d9` made stale and cutoff plans settle once with truthful `missed`/`partial`/`failed` results, kept idle polls independent of lark-cli, required positive user identity on every successful calendar envelope, and normalized malformed authentication data. Task 9 then passed an independent review with no Critical, Important, or Minor findings.
+
+**READY.** The completed Skill and runtime satisfy every scored behavioral invariant and the post-evaluation release checks. The five valid normal samples converged (`5/5`), all four targeted boundary samples passed (`4/4`), the deterministic suite passed all `132` tests, structural validation passed, and the redacted live room shape is covered by the reviewed regression fix in `08896b3`.
 
 The only failed response was the deliberate no-Skill control, which demonstrates the behavior difference the Skill is intended to supply. The discarded harness runs were not scored because they could not load the artifact. No remaining wording gap requires another RED-GREEN-REFACTOR cycle.
