@@ -132,7 +132,7 @@ Install a stable user LaunchAgent at:
 
 `~/Library/LaunchAgents/com.codex.booking-waterdrop-rooms.plist`
 
-It runs daily at 08:59. When there is no plan due that day, it exits immediately. This avoids installing and unloading a new scheduler for every booking while keeping each reservation plan one-time.
+It polls every 15 seconds using a timezone-independent `StartInterval`; the runner itself evaluates the plan in `Asia/Shanghai` and exits locally before 08:59 or whenever no plan is actionable. This avoids relying on the Mac's system timezone, guarantees a polling opportunity inside the 30-second release window while the Mac is awake, and keeps each reservation plan one-time without installing and unloading a scheduler per booking.
 
 Runtime state lives under:
 
@@ -202,7 +202,7 @@ The runner may start before or during the booking window:
 
 - Before 09:00: wait until 09:00:00.
 - From 09:00:00 through 09:00:30: start immediately and use only the remaining window.
-- After 09:00:30: mark the plan as missed and do not book.
+- After 09:00:30: never create a new event. Convert untouched pending slots to `missed`, preserve already terminal slot outcomes, and aggregate truthfully (`success + missed` is `partial`; two missed slots are `missed`; a failed slot without any success remains `failed`). An `uncertain` slot may perform only bounded, exact read-only recovery and must never return to room lookup or creation.
 
 Retryable failures include transient network failures, rate limits that can be honored before the deadline, and rooms lost to concurrent booking.
 
