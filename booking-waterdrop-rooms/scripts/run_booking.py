@@ -351,6 +351,30 @@ def _recovered_slot(slot: dict, event_id: str) -> dict:
     }
 
 
+def _uncertain_slot(slot: dict) -> dict:
+    updated = dict(slot)
+    updated["status"] = "uncertain"
+    updated["event_id"] = None
+    updated["error"] = updated.get("error") or safe_error(
+        LarkError("uncertain", "ambiguous")
+    )
+    return updated
+
+
+def _recover_uncertain_once(plan: dict, slot: dict, client) -> dict:
+    start_iso, end_iso = slot_iso(plan, slot)
+    updated = _uncertain_slot(slot)
+    try:
+        event_id = client.find_matching_event(
+            start_iso, end_iso, updated["room_id"]
+        )
+        if event_id:
+            return _recovered_slot(updated, event_id)
+    except LarkError as exc:
+        updated["error"] = safe_error(exc)
+    return updated
+
+
 def _recover_uncertain_slot(
     plan: dict,
     slot: dict,
@@ -361,12 +385,7 @@ def _recover_uncertain_slot(
 ) -> dict:
     start_iso, end_iso = slot_iso(plan, slot)
     backoff_index = 0
-    updated = dict(slot)
-    updated["status"] = "uncertain"
-    updated["event_id"] = None
-    updated["error"] = updated.get("error") or safe_error(
-        LarkError("uncertain", "ambiguous")
-    )
+    updated = _uncertain_slot(slot)
     while clock() <= deadline:
         try:
             event_id = client.find_matching_event(
@@ -494,6 +513,37 @@ def execute_plan_in_memory(
     start = datetime.combine(execution_date, time(9, 0), TZ)
     deadline = datetime.combine(execution_date, time(9, 0, 30), TZ)
     if current > deadline:
+        if any(
+            slot.get("status") == "uncertain"
+            for slot in plan["slots"]
+        ):
+            ordered = []
+            for slot in plan["slots"]:
+                if slot.get("status") == "uncertain":
+                    updated = _recover_uncertain_once(plan, slot, client)
+                    if updated.get("status") == "success":
+                        on_slot_success(updated)
+                    ordered.append(updated)
+                elif slot.get("status") == "pending":
+                    ordered.append(
+                        {
+                            **slot,
+                            "status": "missed",
+                            "error": "execution window missed",
+                        }
+                    )
+                else:
+                    ordered.append(dict(slot))
+            successes = sum(
+                slot["status"] == "success" for slot in ordered
+            )
+            if successes == 2:
+                status = "success"
+            elif successes == 1:
+                status = "partial"
+            else:
+                status = "failed"
+            return {**plan, "status": status, "slots": ordered}
         return {
             **plan,
             "status": "missed",
@@ -571,8 +621,15 @@ def execute_due_plan(
             return {"status": "idle"}
         validate_plan_for_execution(plan)
         history = _history_path(state_dir, plan["plan_id"])
-        local_date = now.astimezone(TZ).date().isoformat()
-        if plan["execution_date"] != local_date:
+        local_date = now.astimezone(TZ).date()
+        execution_date = date.fromisoformat(plan["execution_date"])
+        has_uncertain = any(
+            slot.get("status") == "uncertain"
+            for slot in plan["slots"]
+        )
+        if local_date < execution_date or (
+            local_date > execution_date and not has_uncertain
+        ):
             return {"status": "idle"}
 
         persistence_lock = threading.Lock()
@@ -960,7 +1017,20 @@ def _classify_lark_error(
     message: str,
     transport_kind: str,
     unknown_error_kind: str,
+    code: object = None,
+    status: object = None,
 ) -> str:
+    def is_exact_429(value: object) -> bool:
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and value == 429
+        ) or (
+            isinstance(value, str) and value.strip() == "429"
+        )
+
+    if is_exact_429(code) or is_exact_429(status):
+        return "safe_retry"
     normalized_subtype = re.sub(r"[_-]+", " ", subtype.lower())
     normalized_message = re.sub(r"[_-]+", " ", message.lower())
     normalized = re.sub(
@@ -994,7 +1064,7 @@ def _classify_lark_error(
         return "fatal"
     if any(
         marker in normalized
-        for marker in ("rate limit", "429", "too many requests")
+        for marker in ("rate limit", "too many requests")
     ):
         return "safe_retry"
     if any(
@@ -1019,10 +1089,6 @@ def _classify_lark_error(
             "transport",
             "unavailable",
             "internal server",
-            "500",
-            "502",
-            "503",
-            "504",
         )
     ):
         return transport_kind
@@ -1092,6 +1158,8 @@ class LarkClient:
                 message,
                 transport_kind,
                 unknown_error_kind,
+                error.get("code"),
+                error.get("status"),
             )
             raise LarkError(message, kind)
         if payload.get("identity") not in (None, "user"):

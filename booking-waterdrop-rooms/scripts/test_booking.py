@@ -839,8 +839,8 @@ class ExecutionRetryTests(unittest.TestCase):
                         "ok": False,
                         "identity": "user",
                         "error": {
-                            "type": "rate_limit",
-                            "message": "429 too many requests",
+                            "code": 429,
+                            "message": "request rejected",
                         },
                     }
                     returncode = 1
@@ -1191,6 +1191,100 @@ class IdempotencyRecoveryTests(unittest.TestCase):
 
         self.assertEqual(result["slots"][0]["status"], "uncertain")
         self.assertEqual(pending["slots"][0]["status"], "uncertain")
+
+    def test_monotonic_post_cutoff_and_next_day_recovery_is_single_shot(self):
+        plan = self.make_plan()
+        plan["slots"][0].update(
+            status="uncertain",
+            room_id="omm_703",
+            room_name="水滴大厦-7F-703",
+            event_id=None,
+            error="event creation result is uncertain",
+        )
+        clock = FakeClock(datetime(2026, 7, 14, 9, 0, 30, tzinfo=TZ))
+
+        class RecoveryProbe:
+            update_notice = False
+
+            def __init__(self):
+                self.auth_calls = 0
+                self.find_calls = 0
+                self.room_find_calls = 0
+                self.create_calls = 0
+
+            def auth_status(self):
+                self.auth_calls += 1
+
+            def find_matching_event(self, start_iso, end_iso, room_id):
+                self.find_calls += 1
+                return None
+
+            def room_find(self, start_iso, end_iso):
+                self.room_find_calls += 1
+                raise AssertionError("post-cutoff room-find must not run")
+
+            def create_event(self, start_iso, end_iso, room_id):
+                self.create_calls += 1
+                raise AssertionError("post-cutoff create must not run")
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            manage._atomic_write_json(manage.plan_path(state_dir), plan)
+
+            at_cutoff = RecoveryProbe()
+            first = runner.execute_due_plan(
+                state_dir,
+                clock.now(),
+                at_cutoff,
+                clock.now,
+                lambda seconds: self.fail("cutoff recovery must not sleep"),
+                lambda result: None,
+            )
+
+            with clock.lock:
+                clock.current += timedelta(seconds=1)
+            after_cutoff = RecoveryProbe()
+            second = runner.execute_due_plan(
+                state_dir,
+                clock.now(),
+                after_cutoff,
+                clock.now,
+                lambda seconds: self.fail("single-shot recovery must not sleep"),
+                lambda result: None,
+            )
+
+            with clock.lock:
+                clock.current = datetime(
+                    2026, 7, 15, 9, 0, tzinfo=TZ
+                )
+            next_day = RecoveryProbe()
+            third = runner.execute_due_plan(
+                state_dir,
+                clock.now(),
+                next_day,
+                clock.now,
+                lambda seconds: self.fail("next-day recovery must not sleep"),
+                lambda result: None,
+            )
+
+            status_output = io.StringIO()
+            with contextlib.redirect_stdout(status_output):
+                manage.main(["--state-dir", str(state_dir), "status"])
+            visible = json.loads(status_output.getvalue())
+
+        self.assertEqual(
+            [first["status"], second["status"], third["status"]],
+            ["partial", "partial", "partial"],
+        )
+        for probe in (at_cutoff, after_cutoff, next_day):
+            self.assertEqual(probe.auth_calls, 1)
+            self.assertEqual(probe.find_calls, 1)
+            self.assertEqual(probe.room_find_calls, 0)
+            self.assertEqual(probe.create_calls, 0)
+        self.assertEqual(
+            visible["pending"]["slots"][0]["status"], "uncertain"
+        )
+        self.assertEqual(visible["latest_result"]["status"], "partial")
 
 
 class PlanValidationSecurityTests(unittest.TestCase):
@@ -2794,6 +2888,43 @@ class RoomRankingTests(unittest.TestCase):
 
 
 class LarkCommandTests(unittest.TestCase):
+    def test_create_structured_429_code_or_status_is_safe_retry(self):
+        cases = (
+            ("code", 429, "safe_retry"),
+            ("code", 429.0, "safe_retry"),
+            ("code", "429", "safe_retry"),
+            ("status", 429, "safe_retry"),
+            ("status", "429", "safe_retry"),
+            ("code", 1429, "ambiguous"),
+            ("status", "1429", "ambiguous"),
+        )
+
+        for field, value, expected_kind in cases:
+            with self.subTest(field=field, value=value):
+                payload = {
+                    "ok": False,
+                    "identity": "user",
+                    "error": {
+                        field: value,
+                        "message": "request rejected",
+                    },
+                }
+                client = runner.LarkClient(
+                    Path("lark-cli"),
+                    lambda argv, **kwargs: mock.Mock(
+                        returncode=1,
+                        stdout="",
+                        stderr=json.dumps(payload),
+                    ),
+                )
+                with self.assertRaises(runner.LarkError) as caught:
+                    client.create_event(
+                        "2026-07-16T10:00:00+08:00",
+                        "2026-07-16T11:00:00+08:00",
+                        "omm_703",
+                    )
+                self.assertEqual(caught.exception.kind, expected_kind)
+
     def test_create_protocol_failures_are_ambiguous(self):
         malformed_outputs = {
             "non-json": "not json",
