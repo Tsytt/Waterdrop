@@ -98,7 +98,10 @@ class PlanStateTests(unittest.TestCase):
     def test_pending_update_can_be_loaded_and_cleared_without_credentials(self):
         manage._atomic_write_json(
             manage.update_state_path(self.state_dir),
-            {"status": "needs_approval"},
+            {
+                "status": "needs_approval",
+                "error": "interactive approval is required for lark-cli update",
+            },
         )
         self.assertEqual(
             manage.load_pending_update(self.state_dir)["status"],
@@ -149,20 +152,20 @@ class PlanStateTests(unittest.TestCase):
             manage.latest_result(self.state_dir)
 
         history.unlink()
-        history.mkdir()
+        history.mkdir(mode=0o700)
         result_link = history / f"{PLAN_ID}.json"
         result_link.symlink_to(outside / f"{PLAN_ID}.json")
-        with self.assertRaisesRegex(ValueError, "symbolic link"):
+        with self.assertRaisesRegex(ValueError, "history"):
             manage.latest_result(self.state_dir)
 
     def test_latest_result_requires_filename_to_match_canonical_plan_id(self):
         result = manage.create_plan(self.state_dir, self.ranges, self.now)
         manage.plan_path(self.state_dir).unlink()
         history = self.state_dir / "history"
-        history.mkdir()
-        (history / f"{PLAN_ID}.json").write_text(
-            json.dumps({**result, "status": "canceled"}),
-            encoding="utf-8",
+        history.mkdir(mode=0o700)
+        manage._atomic_write_json(
+            history / f"{PLAN_ID}.json",
+            {**result, "status": "canceled"},
         )
 
         with self.assertRaisesRegex(ValueError, "history path"):
@@ -214,18 +217,23 @@ state = Path(sys.argv[2])
 boundary = sys.argv[3]
 real_write = manage._atomic_write_json
 real_replace = manage.os.replace
+real_history = manage.write_history
 def write(path, payload):
     real_write(path, payload)
     if boundary == 'marker' and path.name == manage.CANCEL_TRANSACTION_NAME:
         os._exit(91)
-    if boundary == 'history' and path.parent.name == 'history':
-        os._exit(92)
-def replace(source, destination):
-    real_replace(source, destination)
+def replace(source, destination, *args, **kwargs):
+    real_replace(source, destination, *args, **kwargs)
     if boundary == 'eligibility' and Path(source).name == 'pending-plan.json':
         os._exit(93)
+def history(state_dir, payload):
+    result = real_history(state_dir, payload)
+    if boundary == 'history':
+        os._exit(92)
+    return result
 manage._atomic_write_json = write
 manage.os.replace = replace
+manage.write_history = history
 manage.cancel_plan(state)
 """
         scripts = str(SCRIPTS)
@@ -255,6 +263,230 @@ manage.cancel_plan(state)
                 self.assertFalse(
                     (case_dir / manage.CANCEL_TOMBSTONE_NAME).exists()
                 )
+
+
+class ManagementRegularStateSecurityTests(unittest.TestCase):
+    def valid_history(self):
+        return {
+            "schema_version": 1,
+            "plan_id": PLAN_ID,
+            "created_at": "2026-07-13T20:00:00+08:00",
+            "execution_date": "2026-07-14",
+            "target_date": "2026-07-16",
+            "status": "success",
+            "slots": [
+                {
+                    "slot_id": "slot-1",
+                    "start": "10:00",
+                    "end": "11:00",
+                    "status": "success",
+                    "room_id": "omm_703",
+                    "room_name": "水滴大厦-7F-703",
+                    "event_id": "evt_703",
+                    "error": None,
+                },
+                {
+                    "slot_id": "slot-2",
+                    "start": "15:00",
+                    "end": "16:00",
+                    "status": "success",
+                    "room_id": "omm_704",
+                    "room_name": "水滴大厦-7F-704",
+                    "event_id": "evt_704",
+                    "error": None,
+                },
+            ],
+            "completed_at": "2026-07-14T09:00:05+08:00",
+        }
+
+    def test_regular_malformed_history_fails_closed_before_status_prints(self):
+        valid = self.valid_history()
+        failed_with_secret = json.loads(json.dumps(valid))
+        failed_with_secret["status"] = "failed"
+        for slot in failed_with_secret["slots"]:
+            slot.update(
+                status="failed",
+                room_id=None,
+                room_name=None,
+                event_id=None,
+                error="access_token=history-secret",
+            )
+        invalid_payloads = {
+            "non-object": [valid],
+            "unknown top key": {**valid, "unknown": "history-secret"},
+            "non-canonical uuid": {**valid, "plan_id": "../../escape"},
+            "naive created_at": {
+                **valid,
+                "created_at": "2026-07-13T20:00:00",
+            },
+            "naive completed_at": {
+                **valid,
+                "completed_at": "2026-07-14T09:00:05",
+            },
+            "wrong target date": {**valid, "target_date": "2026-07-17"},
+            "overall mismatch": {**valid, "status": "failed"},
+            "sensitive error": failed_with_secret,
+        }
+        pending_history = json.loads(json.dumps(valid))
+        pending_history.pop("completed_at")
+        pending_history["status"] = "pending"
+        for slot in pending_history["slots"]:
+            slot.update(
+                status="pending",
+                room_id=None,
+                room_name=None,
+                event_id=None,
+                error=None,
+            )
+        invalid_payloads["pending is not history"] = pending_history
+        outside_room = json.loads(json.dumps(valid))
+        outside_room["slots"][0]["room_name"] = "别的大厦-7F-703"
+        invalid_payloads["outside building"] = outside_room
+
+        for case, payload in invalid_payloads.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                state_dir = Path(directory) / "state"
+                plan_id = (
+                    payload.get("plan_id", PLAN_ID)
+                    if isinstance(payload, dict)
+                    else PLAN_ID
+                )
+                filename = (
+                    plan_id if plan_id == PLAN_ID else PLAN_ID
+                )
+                manage._atomic_write_json(
+                    state_dir / "history" / f"{filename}.json",
+                    payload,
+                )
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "history|plan",
+                    ):
+                        manage.main(
+                            ["--state-dir", str(state_dir), "status"]
+                        )
+                self.assertEqual(output.getvalue(), "")
+                self.assertNotIn("history-secret", output.getvalue())
+
+    def test_pending_update_accepts_only_canonical_needs_approval_state(self):
+        canonical = {
+            "status": "needs_approval",
+            "error": "interactive approval is required for lark-cli update",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory) / "state"
+            manage._atomic_write_json(
+                manage.update_state_path(state_dir), canonical
+            )
+            self.assertEqual(manage.load_pending_update(state_dir), canonical)
+
+        invalid = [
+            {"status": "needs_approval"},
+            {**canonical, "access_token": "update-secret"},
+            {**canonical, "status": "updated"},
+            {**canonical, "error": 3},
+            {**canonical, "error": "access_token=update-secret"},
+        ]
+        for payload in invalid:
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as directory:
+                state_dir = Path(directory) / "state"
+                manage._atomic_write_json(
+                    manage.update_state_path(state_dir), payload
+                )
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    with self.assertRaisesRegex(ValueError, "pending update"):
+                        manage.main(
+                            ["--state-dir", str(state_dir), "status"]
+                        )
+                self.assertEqual(output.getvalue(), "")
+                self.assertNotIn("update-secret", output.getvalue())
+
+    def test_latest_result_keeps_verified_history_fd_during_parent_swap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            history = state_dir / "history"
+            detached = state_dir / "verified-history"
+            outside = root / "outside-history"
+            state_dir.mkdir(mode=0o700)
+            manage._atomic_write_json(
+                history / f"{PLAN_ID}.json", self.valid_history()
+            )
+            outside.mkdir(mode=0o700)
+            outside_payload = self.valid_history()
+            outside_payload["slots"][0]["event_id"] = "outside-secret"
+            manage._atomic_write_json(
+                outside / f"{PLAN_ID}.json", outside_payload
+            )
+            real_listdir = manage.os.listdir
+            raced = False
+
+            def swap_after_open(directory_fd):
+                nonlocal raced
+                if not raced and isinstance(directory_fd, int):
+                    raced = True
+                    history.rename(detached)
+                    history.symlink_to(outside, target_is_directory=True)
+                return real_listdir(directory_fd)
+
+            with mock.patch.object(
+                manage.os,
+                "listdir",
+                side_effect=swap_after_open,
+            ):
+                result = manage.latest_result(state_dir)
+
+            self.assertTrue(raced)
+            self.assertEqual(result["slots"][0]["event_id"], "evt_703")
+            self.assertNotIn("outside-secret", json.dumps(result))
+
+    def test_history_write_keeps_verified_fd_during_parent_swap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            history = state_dir / "history"
+            detached = state_dir / "verified-history"
+            outside = root / "outside-history"
+            history.mkdir(parents=True, mode=0o700)
+            outside.mkdir(mode=0o700)
+            sentinel = outside / f"{PLAN_ID}.json"
+            sentinel.write_text("outside-sentinel", encoding="utf-8")
+            os.chmod(sentinel, 0o600)
+            real_open = manage.os.open
+            raced = False
+
+            def swap_before_temp_open(path, flags, *args, **kwargs):
+                nonlocal raced
+                if (
+                    not raced
+                    and kwargs.get("dir_fd") is not None
+                    and isinstance(path, str)
+                    and path.startswith(f".{PLAN_ID}.")
+                ):
+                    raced = True
+                    history.rename(detached)
+                    history.symlink_to(outside, target_is_directory=True)
+                return real_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(
+                manage.os,
+                "open",
+                side_effect=swap_before_temp_open,
+            ):
+                manage.write_history(
+                    state_dir,
+                    self.valid_history(),
+                )
+
+            self.assertTrue(raced)
+            self.assertEqual(sentinel.read_text(), "outside-sentinel")
+            written = json.loads(
+                (detached / f"{PLAN_ID}.json").read_text()
+            )
+            self.assertEqual(written["status"], "success")
 
 
 class SchedulerTests(unittest.TestCase):
@@ -660,7 +892,10 @@ class SchedulerTests(unittest.TestCase):
         self.plist_path.write_text("plist")
         manage._atomic_write_json(
             manage.update_state_path(self.state_dir),
-            {"status": "needs_approval"},
+            {
+                "status": "needs_approval",
+                "error": "interactive approval is required for lark-cli update",
+            },
         )
         result = manage.uninstall_scheduler(
             self.state_dir,
@@ -686,7 +921,10 @@ class SchedulerTests(unittest.TestCase):
         )
         manage._atomic_write_json(
             manage.update_state_path(self.state_dir),
-            {"status": "needs_approval"},
+            {
+                "status": "needs_approval",
+                "error": "interactive approval is required for lark-cli update",
+            },
         )
         self.plist_path.parent.mkdir(parents=True)
         self.plist_path.write_text("plist")
@@ -1711,6 +1949,7 @@ class IdempotencyRecoveryTests(unittest.TestCase):
             pending = manage.load_plan(state_dir)
 
         self.assertEqual(result["slots"][0]["status"], "uncertain")
+        self.assertEqual(result["status"], "partial")
         self.assertEqual(pending["slots"][0]["status"], "uncertain")
 
     def test_monotonic_post_cutoff_and_next_day_recovery_is_single_shot(self):
@@ -2087,7 +2326,7 @@ class PlanValidationSecurityTests(unittest.TestCase):
                 lambda seconds: None,
             )
 
-    def test_history_path_rejects_symlink_escape(self):
+    def test_history_write_rejects_symlink_escape(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             state_dir = root / "state"
@@ -2096,8 +2335,10 @@ class PlanValidationSecurityTests(unittest.TestCase):
             state_dir.mkdir()
             (state_dir / "history").symlink_to(outside, target_is_directory=True)
 
-            with self.assertRaisesRegex(runner.LarkError, "history path"):
-                runner._history_path(state_dir, PLAN_ID)
+            result = self.make_plan()
+            result["status"] = "canceled"
+            with self.assertRaisesRegex(ValueError, "history"):
+                manage.write_history(state_dir, result)
 
 
 class ExecutionConcurrencyTests(unittest.TestCase):
@@ -2981,7 +3222,10 @@ class RunnerCliTests(unittest.TestCase):
             state_dir = Path(directory)
             manage._atomic_write_json(
                 manage.update_state_path(state_dir),
-                {"status": "needs_approval"},
+                {
+                    "status": "needs_approval",
+                    "error": "interactive approval is required for lark-cli update",
+                },
             )
             with (
                 mock.patch.dict(

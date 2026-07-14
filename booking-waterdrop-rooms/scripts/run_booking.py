@@ -315,26 +315,6 @@ def _pending_plan_from_result(plan: dict, result: dict) -> dict:
     return pending
 
 
-def _history_path(state_dir: Path, plan_id: str) -> Path:
-    try:
-        if str(uuid.UUID(plan_id)) != plan_id:
-            raise ValueError("invalid plan id")
-    except (TypeError, ValueError, AttributeError) as exc:
-        raise LarkError("history path is not confined", "fatal") from exc
-    history_dir = state_dir / "history"
-    if history_dir.is_symlink():
-        raise LarkError("history path is not confined", "fatal")
-    resolved_state = state_dir.resolve(strict=False)
-    resolved_history = history_dir.resolve(strict=False)
-    candidate = history_dir / f"{plan_id}.json"
-    if (
-        resolved_history.parent != resolved_state
-        or candidate.resolve(strict=False).parent != resolved_history
-    ):
-        raise LarkError("history path is not confined", "fatal")
-    return candidate
-
-
 def slot_iso(plan: dict, slot: dict) -> tuple[str, str]:
     target = date.fromisoformat(plan["target_date"])
     start = datetime.combine(target, time.fromisoformat(slot["start"]), TZ)
@@ -623,7 +603,6 @@ def execute_due_plan(
         if not plan:
             return {"status": "idle"}
         validate_plan_for_execution(plan)
-        history = _history_path(state_dir, plan["plan_id"])
         local_date = now.astimezone(TZ).date()
         execution_date = date.fromisoformat(plan["execution_date"])
         has_uncertain = any(
@@ -664,16 +643,27 @@ def execute_due_plan(
             )
         except LarkError as exc:
             reason = safe_error(exc)
+            failed_slots = [
+                slot
+                if slot.get("status")
+                in {"success", "uncertain", "failed"}
+                else {**slot, "status": "failed", "error": reason}
+                for slot in plan["slots"]
+            ]
+            successes = sum(
+                slot.get("status") == "success"
+                for slot in failed_slots
+            )
             result = {
                 **plan,
-                "status": "failed",
-                "slots": [
-                    slot
-                    if slot.get("status")
-                    in {"success", "uncertain", "failed"}
-                    else {**slot, "status": "failed", "error": reason}
-                    for slot in plan["slots"]
-                ],
+                "status": (
+                    "success"
+                    if successes == 2
+                    else "partial"
+                    if successes == 1
+                    else "failed"
+                ),
+                "slots": failed_slots,
             }
         result["completed_at"] = clock().isoformat()
         unresolved = any(
@@ -684,7 +674,7 @@ def execute_due_plan(
             pending = _pending_plan_from_result(plan, result)
             manage._atomic_write_json(manage.plan_path(state_dir), pending)
         result = _canonical_history(result)
-        manage._atomic_write_json(history, result)
+        manage.write_history(state_dir, result)
         if not unresolved:
             manage.plan_path(state_dir).unlink(missing_ok=True)
     notifier(result)

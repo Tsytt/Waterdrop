@@ -59,6 +59,24 @@ SLOT_ALLOWED_KEYS = frozenset(
 )
 HISTORY_ALLOWED_KEYS = frozenset({*PLAN_ALLOWED_KEYS, "completed_at"})
 SAFE_SLOT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+ROOM_ID_RE = re.compile(r"^omm_[A-Za-z0-9_-]+$")
+WATERDROP_ROOM_RE = re.compile(r"^水滴大厦(?:-|$)")
+SAFE_SLOT_ERRORS = frozenset(
+    {
+        "room no longer available",
+        "temporary rate limit",
+        "temporary Feishu or network error",
+        "event creation result is uncertain",
+        "non-retryable Feishu error",
+        "Feishu operation failed",
+        "no available room",
+        "execution window missed",
+    }
+)
+PENDING_UPDATE = {
+    "status": "needs_approval",
+    "error": "interactive approval is required for lark-cli update",
+}
 
 
 class ExistingPlanError(RuntimeError):
@@ -225,76 +243,98 @@ def _canonical_uuid(value: object) -> str:
     return value
 
 
+def _valid_room(room_id: object, room_name: object) -> bool:
+    return (
+        isinstance(room_id, str)
+        and ROOM_ID_RE.fullmatch(room_id) is not None
+        and isinstance(room_name, str)
+        and WATERDROP_ROOM_RE.match(room_name) is not None
+    )
+
+
+def _valid_slot_state(slot: dict, *, allow_missed: bool) -> bool:
+    slot_status = slot["status"]
+    room_id = slot["room_id"]
+    room_name = slot["room_name"]
+    event_id = slot["event_id"]
+    error = slot["error"]
+    if slot_status == "pending" and not allow_missed:
+        return all(
+            value is None
+            for value in (room_id, room_name, event_id, error)
+        )
+    if slot_status == "success":
+        return (
+            _valid_room(room_id, room_name)
+            and isinstance(event_id, str)
+            and bool(event_id.strip())
+            and error is None
+        )
+    if slot_status == "uncertain":
+        return (
+            _valid_room(room_id, room_name)
+            and event_id is None
+            and error in SAFE_SLOT_ERRORS
+        )
+    if slot_status == "failed":
+        return (
+            room_id is None
+            and room_name is None
+            and event_id is None
+            and error in SAFE_SLOT_ERRORS
+        )
+    if allow_missed and slot_status == "missed":
+        return (
+            room_id is None
+            and room_name is None
+            and event_id is None
+            and error == "execution window missed"
+        )
+    return False
+
+
+def _validate_common_plan_fields(plan: dict) -> tuple[date, date, list[dict]]:
+    _canonical_uuid(plan["plan_id"])
+    if type(plan["schema_version"]) is not int or plan["schema_version"] != 1:
+        raise ValueError
+    created_at = datetime.fromisoformat(plan["created_at"])
+    if created_at.tzinfo is None:
+        raise ValueError
+    execution = date.fromisoformat(plan["execution_date"])
+    target = date.fromisoformat(plan["target_date"])
+    if target != execution + timedelta(days=2):
+        raise ValueError
+    slots = plan["slots"]
+    if not isinstance(slots, list) or len(slots) != 2:
+        raise ValueError
+    if any(
+        not isinstance(slot, dict) or set(slot) != SLOT_ALLOWED_KEYS
+        for slot in slots
+    ):
+        raise ValueError
+    validate_ranges([f"{slot['start']}-{slot['end']}" for slot in slots])
+    slot_ids = [slot["slot_id"] for slot in slots]
+    if len(set(slot_ids)) != 2 or any(
+        not isinstance(slot_id, str)
+        or SAFE_SLOT_ID_RE.fullmatch(slot_id) is None
+        for slot_id in slot_ids
+    ):
+        raise ValueError
+    return execution, target, slots
+
+
 def _validate_plan(plan: object) -> dict:
     try:
         if not isinstance(plan, dict) or set(plan) != PLAN_ALLOWED_KEYS:
             raise ValueError
-        _canonical_uuid(plan["plan_id"])
-        if type(plan["schema_version"]) is not int or plan["schema_version"] != 1:
+        _, _, slots = _validate_common_plan_fields(plan)
+        if plan["status"] != "pending":
             raise ValueError
-        created_at = datetime.fromisoformat(plan["created_at"])
-        if created_at.tzinfo is None:
-            raise ValueError
-        execution = date.fromisoformat(plan["execution_date"])
-        target = date.fromisoformat(plan["target_date"])
-        if target != execution + timedelta(days=2) or plan["status"] != "pending":
-            raise ValueError
-        slots = plan["slots"]
-        if not isinstance(slots, list) or len(slots) != 2:
-            raise ValueError
-        if any(not isinstance(slot, dict) or set(slot) != SLOT_ALLOWED_KEYS for slot in slots):
-            raise ValueError
-        validate_ranges([f"{slot['start']}-{slot['end']}" for slot in slots])
-        slot_ids = [slot["slot_id"] for slot in slots]
-        if len(set(slot_ids)) != 2 or any(
-            not isinstance(slot_id, str)
-            or SAFE_SLOT_ID_RE.fullmatch(slot_id) is None
-            for slot_id in slot_ids
+        if any(
+            not _valid_slot_state(slot, allow_missed=False)
+            for slot in slots
         ):
             raise ValueError
-        for slot in slots:
-            slot_status = slot["status"]
-            room_id = slot["room_id"]
-            room_name = slot["room_name"]
-            event_id = slot["event_id"]
-            error = slot["error"]
-            if slot_status == "pending":
-                valid = all(
-                    value is None
-                    for value in (room_id, room_name, event_id, error)
-                )
-            elif slot_status == "success":
-                valid = (
-                    isinstance(room_id, str)
-                    and room_id.startswith("omm_")
-                    and isinstance(room_name, str)
-                    and room_name.startswith("水滴大厦-")
-                    and isinstance(event_id, str)
-                    and bool(event_id.strip())
-                    and error is None
-                )
-            elif slot_status == "uncertain":
-                valid = (
-                    isinstance(room_id, str)
-                    and room_id.startswith("omm_")
-                    and isinstance(room_name, str)
-                    and room_name.startswith("水滴大厦-")
-                    and event_id is None
-                    and isinstance(error, str)
-                    and bool(error.strip())
-                )
-            elif slot_status == "failed":
-                valid = (
-                    room_id is None
-                    and room_name is None
-                    and event_id is None
-                    and isinstance(error, str)
-                    and bool(error.strip())
-                )
-            else:
-                valid = False
-            if not valid:
-                raise ValueError
     except (KeyError, TypeError, ValueError, AttributeError) as exc:
         raise ValueError("invalid plan state") from exc
     return plan
@@ -309,8 +349,6 @@ def _validate_history(result: object) -> dict:
             raise ValueError
         _canonical_uuid(result["plan_id"])
         status = result["status"]
-        if status == "pending":
-            return _validate_plan(result)
         if status not in {"canceled", "success", "partial", "failed", "missed"}:
             raise ValueError
         if status == "canceled":
@@ -318,19 +356,31 @@ def _validate_history(result: object) -> dict:
                 raise ValueError
             _validate_plan({**result, "status": "pending"})
             return result
-        if type(result["schema_version"]) is not int or result["schema_version"] != 1:
+        if set(result) != HISTORY_ALLOWED_KEYS:
             raise ValueError
-        datetime.fromisoformat(result["created_at"])
-        date.fromisoformat(result["execution_date"])
-        date.fromisoformat(result["target_date"])
-        slots = result["slots"]
-        if not isinstance(slots, list) or len(slots) != 2:
+        _, _, slots = _validate_common_plan_fields(result)
+        completed_at = datetime.fromisoformat(result["completed_at"])
+        if completed_at.tzinfo is None:
             raise ValueError
-        if any(not isinstance(slot, dict) or set(slot) != SLOT_ALLOWED_KEYS for slot in slots):
+        if any(
+            not _valid_slot_state(slot, allow_missed=True)
+            for slot in slots
+        ):
             raise ValueError
-        validate_ranges([f"{slot['start']}-{slot['end']}" for slot in slots])
-        if "completed_at" in result:
-            datetime.fromisoformat(result["completed_at"])
+        statuses = [slot["status"] for slot in slots]
+        successes = statuses.count("success")
+        overall_valid = {
+            "success": successes == 2,
+            "partial": successes == 1,
+            "missed": successes == 0 and set(statuses) == {"missed"},
+            "failed": (
+                successes == 0
+                and set(statuses) != {"missed"}
+                and set(statuses) <= {"failed", "uncertain", "missed"}
+            ),
+        }.get(status, False)
+        if not overall_valid:
+            raise ValueError
     except (KeyError, TypeError, ValueError, AttributeError) as exc:
         raise ValueError("invalid history result") from exc
     return result
@@ -371,6 +421,182 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
             os.unlink(temporary)
 
 
+def _directory_flags() -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return flags
+
+
+def _verify_private_directory_fd(descriptor: int, label: str) -> None:
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        raise ValueError(f"unsafe {label}")
+
+
+@contextlib.contextmanager
+def _opened_history_dir(
+    state_dir: Path,
+    *,
+    create: bool,
+) -> Iterator[int | None]:
+    _ensure_safe_state_dir(state_dir, create=create)
+    state_descriptor = None
+    try:
+        state_descriptor = os.open(state_dir, _directory_flags())
+    except FileNotFoundError:
+        if create:
+            raise
+        yield None
+        return
+    except OSError as exc:
+        raise ValueError("unsafe state directory") from exc
+    history_descriptor = None
+    try:
+        _verify_private_directory_fd(state_descriptor, "state directory")
+        if create:
+            try:
+                os.mkdir("history", 0o700, dir_fd=state_descriptor)
+            except FileExistsError:
+                pass
+        try:
+            history_descriptor = os.open(
+                "history",
+                _directory_flags(),
+                dir_fd=state_descriptor,
+            )
+        except FileNotFoundError:
+            if create:
+                raise
+            yield None
+            return
+        except OSError as exc:
+            raise ValueError("unsafe history directory") from exc
+        _verify_private_directory_fd(
+            history_descriptor,
+            "history directory",
+        )
+        yield history_descriptor
+    finally:
+        if history_descriptor is not None:
+            os.close(history_descriptor)
+        if state_descriptor is not None:
+            os.close(state_descriptor)
+
+
+def _verify_private_regular_file(
+    descriptor: int,
+    label: str,
+) -> os.stat_result:
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        raise ValueError(f"unsafe {label}")
+    return metadata
+
+
+def _read_json_at(
+    directory_descriptor: int,
+    name: str,
+    *,
+    label: str,
+) -> tuple[object, os.stat_result]:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(
+            name,
+            flags,
+            dir_fd=directory_descriptor,
+        )
+    except OSError as exc:
+        raise ValueError(f"unsafe {label}") from exc
+    try:
+        metadata = _verify_private_regular_file(descriptor, label)
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            descriptor = -1
+            try:
+                return json.load(handle), metadata
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid {label}: malformed JSON") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _atomic_write_json_at(
+    directory_descriptor: int,
+    name: str,
+    payload: dict,
+) -> None:
+    try:
+        existing = os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        existing = None
+    if existing is not None and (
+        not stat.S_ISREG(existing.st_mode)
+        or existing.st_uid != os.geteuid()
+        or stat.S_IMODE(existing.st_mode) & 0o077
+    ):
+        raise ValueError("unsafe history result")
+    temporary = f".{name}.{uuid.uuid4().hex}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(
+        temporary,
+        flags,
+        0o600,
+        dir_fd=directory_descriptor,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fchmod(handle.fileno(), 0o600)
+            os.fsync(handle.fileno())
+        os.replace(
+            temporary,
+            name,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+        )
+        os.fsync(directory_descriptor)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary, dir_fd=directory_descriptor)
+        except FileNotFoundError:
+            pass
+
+
+def write_history(state_dir: Path, payload: dict) -> dict:
+    result = _validate_history(payload)
+    name = f"{_canonical_uuid(result['plan_id'])}.json"
+    with _opened_history_dir(state_dir, create=True) as history_descriptor:
+        if history_descriptor is None:
+            raise AssertionError("history directory was not created")
+        _atomic_write_json_at(history_descriptor, name, result)
+    return result
+
+
 @contextlib.contextmanager
 def locked_state(state_dir: Path) -> Iterator[None]:
     _ensure_safe_state_dir(state_dir, create=True)
@@ -401,30 +627,30 @@ def load_plan(state_dir: Path) -> dict | None:
 
 
 def latest_result(state_dir: Path) -> dict | None:
-    _ensure_safe_state_dir(state_dir, create=False)
-    history_dir = state_dir / "history"
-    if not _path_exists(history_dir):
-        return None
-    _ensure_safe_directory(
-        history_dir,
-        create=False,
-        label="history directory",
-    )
-    candidates = []
-    for path in history_dir.glob("*.json"):
-        metadata = os.lstat(path)
-        if stat.S_ISLNK(metadata.st_mode):
-            raise ValueError("unsafe history result: symbolic link")
-        if stat.S_ISREG(metadata.st_mode):
-            candidates.append((metadata.st_mtime_ns, path))
-    if not candidates:
-        return None
-    newest = max(candidates, key=lambda item: item[0])[1]
-    payload = _read_json_no_follow(newest, label="history result")
-    result = _validate_history(payload)
-    if newest.stem != result["plan_id"]:
-        raise ValueError("history path does not match plan id")
-    return result
+    with _opened_history_dir(state_dir, create=False) as history_descriptor:
+        if history_descriptor is None:
+            return None
+        candidates = []
+        for name in os.listdir(history_descriptor):
+            if not name.endswith(".json"):
+                continue
+            stem = name[:-5]
+            try:
+                _canonical_uuid(stem)
+            except ValueError as exc:
+                raise ValueError("history path is not canonical") from exc
+            payload, metadata = _read_json_at(
+                history_descriptor,
+                name,
+                label="history result",
+            )
+            result = _validate_history(payload)
+            if stem != result["plan_id"]:
+                raise ValueError("history path does not match plan id")
+            candidates.append((metadata.st_mtime_ns, result))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: item[0])[1]
 
 
 def load_pending_update(state_dir: Path) -> dict | None:
@@ -435,7 +661,7 @@ def load_pending_update(state_dir: Path) -> dict | None:
     )
     if payload is None:
         return None
-    if not isinstance(payload, dict):
+    if not isinstance(payload, dict) or payload != PENDING_UPDATE:
         raise ValueError("invalid pending update")
     return payload
 
@@ -481,22 +707,6 @@ def create_plan(
         }
         _atomic_write_json(plan_path(state_dir), plan)
         return plan
-
-
-def _history_path(state_dir: Path, plan_id: object) -> Path:
-    canonical = _canonical_uuid(plan_id)
-    _ensure_safe_state_dir(state_dir, create=True)
-    history_dir = state_dir / "history"
-    _ensure_safe_directory(
-        history_dir,
-        create=True,
-        mode=0o700,
-        label="history directory",
-    )
-    candidate = history_dir / f"{canonical}.json"
-    if candidate.parent != history_dir:
-        raise ValueError("history path is not confined")
-    return candidate
 
 
 def _cancel_transaction_path(state_dir: Path) -> Path:
@@ -551,10 +761,7 @@ def _recover_cancel_transaction_unlocked(state_dir: Path) -> None:
         pending = _validate_plan(tombstone)
         if pending["plan_id"] != canceled["plan_id"]:
             raise ValueError("cancellation tombstone plan mismatch")
-    _atomic_write_json(
-        _history_path(state_dir, canceled["plan_id"]),
-        canceled,
-    )
+    write_history(state_dir, canceled)
     tombstone_path.unlink(missing_ok=True)
     marker_path.unlink(missing_ok=True)
 
@@ -571,10 +778,7 @@ def cancel_plan(state_dir: Path) -> dict | None:
         )
         os.replace(plan_path(state_dir), _cancel_tombstone_path(state_dir))
         _fsync_directory(state_dir)
-        _atomic_write_json(
-            _history_path(state_dir, canceled["plan_id"]),
-            canceled,
-        )
+        write_history(state_dir, canceled)
         _cancel_tombstone_path(state_dir).unlink(missing_ok=True)
         _cancel_transaction_path(state_dir).unlink(missing_ok=True)
         return canceled
