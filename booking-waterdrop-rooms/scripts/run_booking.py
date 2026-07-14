@@ -24,13 +24,15 @@ TZ = ZoneInfo("Asia/Shanghai")
 BUILDING = "水滴大厦"
 PREFERRED_NAMES = {"7F-703", "7F-704"}
 BACKOFF = (0.5, 1, 2, 4, 5)
+NOTIFICATION_TIMEOUT = 10
 BUILDING_PREFIX_RE = re.compile(rf"^{re.escape(BUILDING)}(?:-|$)")
 ROOM_BUILDING_RE = re.compile(r"^([^-]*大厦)(?:-|$)")
 FLOOR_RE = re.compile(
     r"(?:^|[-\s])(\d{1,2})F(?:[-\s]|$)", re.IGNORECASE
 )
 SENSITIVE_KEY_RE = re.compile(
-    r"token|secret|authorization|device[_-]?code|verification[_-]?(?:url|uri)",
+    r"token|secret|authorization|device[\s_-]*code|"
+    r"verification[\s_-]*(?:url|uri)",
     re.IGNORECASE,
 )
 BEARER_RE = re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+")
@@ -48,16 +50,50 @@ AUTH_URL_HINT_RE = re.compile(
 )
 SAFE_SLOT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 ROOM_ID_RE = re.compile(r"^omm_[A-Za-z0-9_-]+$")
+PLAN_ALLOWED_KEYS = frozenset(
+    {
+        "schema_version",
+        "plan_id",
+        "created_at",
+        "execution_date",
+        "target_date",
+        "status",
+        "slots",
+    }
+)
+SLOT_ALLOWED_KEYS = frozenset(
+    {
+        "slot_id",
+        "start",
+        "end",
+        "status",
+        "room_id",
+        "room_name",
+        "event_id",
+        "error",
+    }
+)
+HISTORY_ALLOWED_KEYS = frozenset(
+    {*PLAN_ALLOWED_KEYS, "completed_at"}
+)
 SKILLS_UPDATED_RE = re.compile(
-    r"\bskills?\s+(?:were\s+)?updated\b|\bupdated\s+(?:ai\s+)?skills?\b",
-    re.IGNORECASE,
+    r"^\s*(?:"
+    r"skills?\s+(?:were\s+)?updated|"
+    r"updated\s+(?:ai\s+)?skills?|"
+    r"skills?\s+updated\s*:\s*true"
+    r")[.!]?\s*$",
+    re.IGNORECASE | re.MULTILINE,
 )
 SKILLS_UNCHANGED_RE = re.compile(
-    r"\bskills?\s+(?:are\s+)?already\s+up\s+to\s+date\b|"
-    r"\bno\s+(?:ai\s+)?skills?\s+updates?\b|"
-    r"\bskills?\s+(?:are\s+)?unchanged\b|"
-    r"\bskills?\s+(?:were\s+)?not\s+updated\b",
-    re.IGNORECASE,
+    r"^\s*(?:"
+    r"0\s+skills?\s+updated|"
+    r"skills?\s+updated\s*:\s*false|"
+    r"skills?\s+(?:are\s+)?already\s+up\s+to\s+date|"
+    r"no\s+(?:ai\s+)?skills?\s+updates?|"
+    r"skills?\s+(?:are\s+)?unchanged|"
+    r"skills?\s+(?:were\s+)?not\s+updated"
+    r")[.!]?\s*$",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 
@@ -70,6 +106,7 @@ class LarkError(RuntimeError):
 def safe_error(exc: "LarkError") -> str:
     return {
         "room_conflict": "room no longer available",
+        "safe_retry": "temporary rate limit",
         "transient": "temporary Feishu or network error",
         "ambiguous": "event creation result is uncertain",
         "fatal": "non-retryable Feishu error",
@@ -144,41 +181,40 @@ def cleanup_logs(
             entry.unlink()
 
 
+def _nonempty_text(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _waterdrop_room(room_id: object, room_name: object) -> bool:
+    return (
+        isinstance(room_id, str)
+        and ROOM_ID_RE.fullmatch(room_id) is not None
+        and isinstance(room_name, str)
+        and BUILDING_PREFIX_RE.match(room_name) is not None
+    )
+
+
 def validate_plan_for_execution(plan: dict) -> None:
     try:
-        required = {
-            "schema_version",
-            "plan_id",
-            "execution_date",
-            "target_date",
-            "status",
-            "slots",
-        }
-        if not isinstance(plan, dict) or not required.issubset(plan):
-            raise ValueError("missing plan field")
+        if not isinstance(plan, dict) or set(plan) != PLAN_ALLOWED_KEYS:
+            raise ValueError("invalid plan fields")
         plan_id = plan["plan_id"]
         if not isinstance(plan_id, str) or str(uuid.UUID(plan_id)) != plan_id:
             raise ValueError("invalid plan id")
+        created_at = datetime.fromisoformat(plan["created_at"])
+        if created_at.tzinfo is None:
+            raise ValueError("created_at must include a timezone")
         execution = date.fromisoformat(plan["execution_date"])
         target = date.fromisoformat(plan["target_date"])
         slots = plan["slots"]
         if not isinstance(slots, list) or len(slots) != 2:
             raise ValueError("invalid slots")
-        slot_required = {
-            "slot_id",
-            "start",
-            "end",
-            "status",
-            "room_id",
-            "room_name",
-            "event_id",
-            "error",
-        }
         if any(
-            not isinstance(slot, dict) or not slot_required.issubset(slot)
+            not isinstance(slot, dict)
+            or set(slot) != SLOT_ALLOWED_KEYS
             for slot in slots
         ):
-            raise ValueError("missing slot field")
+            raise ValueError("invalid slot fields")
         values = [f"{slot['start']}-{slot['end']}" for slot in slots]
         slot_ids = [slot["slot_id"] for slot in slots]
         manage.validate_ranges(values)
@@ -188,28 +224,32 @@ def validate_plan_for_execution(plan: dict) -> None:
             room_id = slot["room_id"]
             room_name = slot["room_name"]
             event_id = slot["event_id"]
+            error = slot["error"]
             if slot_status == "pending":
                 state_valid = (
                     room_id is None
                     and room_name is None
                     and event_id is None
+                    and error is None
                 )
             elif slot_status == "uncertain":
                 state_valid = (
-                    isinstance(room_id, str)
-                    and ROOM_ID_RE.fullmatch(room_id) is not None
-                    and isinstance(room_name, str)
-                    and bool(room_name)
+                    _waterdrop_room(room_id, room_name)
                     and event_id is None
+                    and _nonempty_text(error)
                 )
             elif slot_status == "success":
                 state_valid = (
-                    isinstance(room_id, str)
-                    and ROOM_ID_RE.fullmatch(room_id) is not None
-                    and isinstance(room_name, str)
-                    and bool(room_name)
-                    and isinstance(event_id, str)
-                    and bool(event_id)
+                    _waterdrop_room(room_id, room_name)
+                    and _nonempty_text(event_id)
+                    and error is None
+                )
+            elif slot_status == "failed":
+                state_valid = (
+                    room_id is None
+                    and room_name is None
+                    and event_id is None
+                    and _nonempty_text(error)
                 )
             else:
                 state_valid = False
@@ -231,6 +271,48 @@ def validate_plan_for_execution(plan: dict) -> None:
         valid = False
     if not valid:
         raise LarkError("invalid plan state", "fatal")
+
+
+def _canonical_slot(slot: dict) -> dict:
+    return redact({key: slot.get(key) for key in SLOT_ALLOWED_KEYS})
+
+
+def _canonical_history(result: dict) -> dict:
+    payload = {
+        key: result.get(key)
+        for key in HISTORY_ALLOWED_KEYS
+        if key != "slots"
+    }
+    payload["slots"] = [
+        _canonical_slot(slot)
+        for slot in result.get("slots", [])
+        if isinstance(slot, dict)
+    ]
+    return redact(payload)
+
+
+def _pending_plan_from_result(plan: dict, result: dict) -> dict:
+    slots = []
+    for slot in result["slots"]:
+        canonical = _canonical_slot(slot)
+        if canonical["status"] == "missed":
+            canonical.update(
+                status="failed",
+                room_id=None,
+                room_name=None,
+                event_id=None,
+                error=canonical["error"] or "execution window missed",
+            )
+        slots.append(canonical)
+    pending = {
+        key: plan[key]
+        for key in PLAN_ALLOWED_KEYS
+        if key not in {"status", "slots"}
+    }
+    pending["status"] = "pending"
+    pending["slots"] = slots
+    validate_plan_for_execution(pending)
+    return pending
 
 
 def _history_path(state_dir: Path, plan_id: str) -> Path:
@@ -327,6 +409,8 @@ def reserve_slot(
     slot = matching_slots[0]
     if slot.get("status") == "success":
         return dict(slot)
+    if slot.get("status") == "failed":
+        return dict(slot)
     if slot.get("status") == "uncertain":
         return _recover_uncertain_slot(
             plan, slot, client, deadline, clock, sleeper
@@ -419,7 +503,11 @@ def execute_plan_in_memory(
                     "status": "missed",
                     "error": "execution window missed",
                 }
-                if slot.get("status") not in {"success", "uncertain"}
+                if slot.get("status") not in {
+                    "success",
+                    "uncertain",
+                    "failed",
+                }
                 else slot
                 for slot in plan["slots"]
             ],
@@ -427,12 +515,14 @@ def execute_plan_in_memory(
     if current < start:
         sleeper((start - current).total_seconds())
     pending = [
-        slot for slot in plan["slots"] if slot.get("status") != "success"
+        slot
+        for slot in plan["slots"]
+        if slot.get("status") in {"pending", "uncertain"}
     ]
     results = {
         slot["slot_id"]: dict(slot)
         for slot in plan["slots"]
-        if slot.get("status") == "success"
+        if slot.get("status") in {"success", "failed"}
     }
 
     def run_slot(slot: dict) -> dict:
@@ -512,14 +602,24 @@ def execute_due_plan(
                 "status": "failed",
                 "slots": [
                     slot
-                    if slot.get("status") == "success"
+                    if slot.get("status")
+                    in {"success", "uncertain", "failed"}
                     else {**slot, "status": "failed", "error": reason}
                     for slot in plan["slots"]
                 ],
             }
         result["completed_at"] = clock().isoformat()
+        unresolved = any(
+            slot.get("status") == "uncertain"
+            for slot in result["slots"]
+        )
+        if unresolved:
+            pending = _pending_plan_from_result(plan, result)
+            manage._atomic_write_json(manage.plan_path(state_dir), pending)
+        result = _canonical_history(result)
         manage._atomic_write_json(history, result)
-        manage.plan_path(state_dir).unlink(missing_ok=True)
+        if not unresolved:
+            manage.plan_path(state_dir).unlink(missing_ok=True)
     notifier(result)
     append_log(
         state_dir / "logs",
@@ -556,6 +656,7 @@ def notify_result(result: dict, run_command=subprocess.run) -> None:
             ],
             text=True,
             capture_output=True,
+            timeout=NOTIFICATION_TIMEOUT,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise LarkError("booking notification failed", "fatal") from exc
@@ -622,19 +723,25 @@ def notify_update_result(
         )
     else:
         detail = "lark-cli 更新需要在下次交互时授权"
-    run_command(
-        [
-            "/usr/bin/osascript",
-            "-e",
-            (
-                f"display notification "
-                f"{json.dumps(detail, ensure_ascii=False)} with title "
-                f"{json.dumps('lark-cli 更新', ensure_ascii=False)}"
-            ),
-        ],
-        text=True,
-        capture_output=True,
-    )
+    try:
+        completed = run_command(
+            [
+                "/usr/bin/osascript",
+                "-e",
+                (
+                    f"display notification "
+                    f"{json.dumps(detail, ensure_ascii=False)} with title "
+                    f"{json.dumps('lark-cli 更新', ensure_ascii=False)}"
+                ),
+            ],
+            text=True,
+            capture_output=True,
+            timeout=NOTIFICATION_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise LarkError("update notification failed", "fatal") from exc
+    if getattr(completed, "returncode", 1) != 0:
+        raise LarkError("update notification failed", "fatal")
 
 
 def _persist_update_result(state_dir: Path, update: dict) -> None:
@@ -848,13 +955,94 @@ def _find_first(node: object, key: str) -> str | None:
     return None
 
 
+def _classify_lark_error(
+    subtype: str,
+    message: str,
+    transport_kind: str,
+    unknown_error_kind: str,
+) -> str:
+    normalized_subtype = re.sub(r"[_-]+", " ", subtype.lower())
+    normalized_message = re.sub(r"[_-]+", " ", message.lower())
+    normalized = re.sub(
+        r"[_-]+", " ", f"{subtype} {message}".lower()
+    )
+    terminal_markers = (
+        "auth",
+        "permission",
+        "forbidden",
+        "unauthorized",
+        "invalid",
+        "parameter",
+        "argument",
+        "bad request",
+    )
+    if any(marker in normalized_subtype for marker in terminal_markers):
+        return "fatal"
+    if any(
+        marker in normalized_message
+        for marker in (
+            "permission denied",
+            "authentication failed",
+            "not authorized",
+            "unauthorized",
+            "forbidden",
+            "invalid parameter",
+            "invalid argument",
+            "bad request",
+        )
+    ):
+        return "fatal"
+    if any(
+        marker in normalized
+        for marker in ("rate limit", "429", "too many requests")
+    ):
+        return "safe_retry"
+    if any(
+        marker in normalized
+        for marker in ("conflict", "occupied", "already booked")
+    ) or (
+        "room" in normalized
+        and any(
+            marker in normalized
+            for marker in ("not available", "no longer available")
+        )
+    ):
+        return "room_conflict"
+    if any(
+        marker in normalized
+        for marker in (
+            "network",
+            "timeout",
+            "reset",
+            "socket",
+            "connection",
+            "transport",
+            "unavailable",
+            "internal server",
+            "500",
+            "502",
+            "503",
+            "504",
+        )
+    ):
+        return transport_kind
+    return unknown_error_kind
+
+
 class LarkClient:
     def __init__(self, binary: Path, run_command=subprocess.run):
         self.binary = binary
         self.run_command = run_command
         self.update_notice = False
 
-    def _json(self, args: list[str], timeout_kind: str = "transient") -> dict:
+    def _json(
+        self,
+        args: list[str],
+        timeout_kind: str = "transient",
+        protocol_kind: str = "fatal",
+        transport_kind: str = "transient",
+        unknown_error_kind: str = "fatal",
+    ) -> dict:
         try:
             result = self.run_command(
                 [str(self.binary), *args],
@@ -867,37 +1055,44 @@ class LarkClient:
             raise LarkError(
                 "lark-cli command timed out", timeout_kind
             ) from exc
+        except (FileNotFoundError, PermissionError) as exc:
+            raise LarkError("lark-cli could not be started", "fatal") from exc
+        except OSError as exc:
+            raise LarkError(
+                "lark-cli transport failed", transport_kind
+            ) from exc
         text = result.stdout if result.returncode == 0 else result.stderr
         try:
             payload = json.loads(text)
         except json.JSONDecodeError as exc:
-            raise LarkError("lark-cli returned non-JSON output") from exc
+            raise LarkError(
+                "lark-cli returned non-JSON output", protocol_kind
+            ) from exc
         if not isinstance(payload, dict):
-            raise LarkError("lark-cli returned a non-object JSON envelope")
+            raise LarkError(
+                "lark-cli returned a non-object JSON envelope",
+                protocol_kind,
+            )
         if (
             isinstance(payload.get("_notice"), dict)
             and payload["_notice"].get("update")
         ):
             self.update_notice = True
         if "error" in payload and not isinstance(payload["error"], dict):
-            raise LarkError("lark-cli returned a malformed error envelope")
+            raise LarkError(
+                "lark-cli returned a malformed error envelope",
+                protocol_kind,
+            )
         if result.returncode != 0 or payload.get("ok") is not True:
             error = payload.get("error", {})
             message = str(error.get("message") or "lark-cli command failed")
             subtype = str(error.get("subtype") or error.get("type") or "")
-            lowered = f"{subtype} {message}".lower()
-            if "rate" in lowered or "429" in lowered or "network" in lowered:
-                kind = "transient"
-            elif (
-                "conflict" in lowered
-                or "occupied" in lowered
-                or "available" in lowered
-            ):
-                kind = "room_conflict"
-            elif "timeout" in lowered:
-                kind = "ambiguous"
-            else:
-                kind = "fatal"
+            kind = _classify_lark_error(
+                subtype,
+                message,
+                transport_kind,
+                unknown_error_kind,
+            )
             raise LarkError(message, kind)
         if payload.get("identity") not in (None, "user"):
             raise LarkError("lark-cli did not use user identity")
@@ -956,6 +1151,9 @@ class LarkClient:
                     "user",
                 ],
                 timeout_kind="ambiguous",
+                protocol_kind="ambiguous",
+                transport_kind="ambiguous",
+                unknown_error_kind="ambiguous",
             )
         except LarkError as exc:
             if exc.kind in {"transient", "ambiguous"}:
@@ -1088,12 +1286,12 @@ def _run_main(args: argparse.Namespace) -> int:
     update = perform_deferred_update(client)
     if update:
         _persist_update_result(args.state_dir, update)
-        notify_update_result(update)
         append_log(
             args.state_dir / "logs",
             datetime.now(TZ),
             {"stage": "lark-cli-update", **update},
         )
+        notify_update_result(update)
     return 0 if result["status"] in {"idle", "success", "partial"} else 1
 
 
