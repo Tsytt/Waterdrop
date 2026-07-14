@@ -22,6 +22,9 @@ import manage_booking as manage
 
 
 TZ = ZoneInfo("Asia/Shanghai")
+PLAN_ID = "11111111-1111-4111-8111-111111111111"
+IDEMPOTENCY_PLAN_ID = "22222222-2222-4222-8222-222222222222"
+PERSIST_PLAN_ID = "33333333-3333-4333-8333-333333333333"
 
 
 class TimeRangeTests(unittest.TestCase):
@@ -648,7 +651,7 @@ class ExecutionRetryTests(unittest.TestCase):
     def make_plan(self):
         return {
             "schema_version": 1,
-            "plan_id": "plan-1",
+            "plan_id": PLAN_ID,
             "execution_date": "2026-07-14",
             "target_date": "2026-07-16",
             "status": "pending",
@@ -658,12 +661,20 @@ class ExecutionRetryTests(unittest.TestCase):
                     "start": "10:00",
                     "end": "11:00",
                     "status": "pending",
+                    "room_id": None,
+                    "room_name": None,
+                    "event_id": None,
+                    "error": None,
                 },
                 {
                     "slot_id": "slot-2",
                     "start": "15:00",
                     "end": "16:00",
                     "status": "pending",
+                    "room_id": None,
+                    "room_name": None,
+                    "event_id": None,
+                    "error": None,
                 },
             ],
         }
@@ -723,13 +734,19 @@ class ExecutionRetryTests(unittest.TestCase):
         self.assertLessEqual(clock.now(), deadline)
 
     def test_successful_slot_is_not_retried(self):
-        slot = self.make_plan()["slots"][0]
-        slot.update(status="success", event_id="evt_existing")
+        plan = self.make_plan()
+        slot = plan["slots"][0]
+        slot.update(
+            status="success",
+            event_id="evt_existing",
+            room_id="omm_existing",
+            room_name="水滴大厦-7F-703",
+        )
         client = FakeClient([], [])
         clock = FakeClock(datetime(2026, 7, 14, 9, 0, tzinfo=TZ))
 
         result = runner.reserve_slot(
-            self.make_plan(),
+            plan,
             slot,
             client,
             datetime(2026, 7, 14, 9, 0, 30, tzinfo=TZ),
@@ -793,11 +810,11 @@ class ExecutionRetryTests(unittest.TestCase):
         self.assertEqual(result["event_id"], "evt_recovered")
 
 
-class ExecutionConcurrencyTests(unittest.TestCase):
+class IdempotencyRecoveryTests(unittest.TestCase):
     def make_plan(self):
         return {
             "schema_version": 1,
-            "plan_id": "plan-1",
+            "plan_id": IDEMPOTENCY_PLAN_ID,
             "execution_date": "2026-07-14",
             "target_date": "2026-07-16",
             "status": "pending",
@@ -807,12 +824,374 @@ class ExecutionConcurrencyTests(unittest.TestCase):
                     "start": "10:00",
                     "end": "11:00",
                     "status": "pending",
+                    "room_id": None,
+                    "room_name": None,
+                    "event_id": None,
+                    "error": None,
+                },
+                {
+                    "slot_id": "slot-2",
+                    "start": "15:00",
+                    "end": "16:00",
+                    "status": "success",
+                    "room_id": "omm_existing",
+                    "room_name": "水滴大厦-7F-705",
+                    "event_id": "evt_existing",
+                    "error": None,
+                },
+            ],
+        }
+
+    def _uncertain_after_create(self, error_kind):
+        room = runner.Room(
+            "omm_703", "水滴大厦-7F-703", "水滴大厦", 7, {}
+        )
+        clock = FakeClock(datetime(2026, 7, 14, 9, 0, tzinfo=TZ))
+
+        class NeverRecoveredClient:
+            def __init__(self):
+                self.create_calls = 0
+                self.find_calls = 0
+
+            def room_find(self, start_iso, end_iso):
+                return [room]
+
+            def create_event(self, start_iso, end_iso, room_id):
+                self.create_calls += 1
+                raise runner.LarkError("unsafe raw network detail", error_kind)
+
+            def find_matching_event(self, start_iso, end_iso, room_id):
+                self.find_calls += 1
+                return None
+
+        client = NeverRecoveredClient()
+        transitions = []
+        result = runner.reserve_slot(
+            self.make_plan(),
+            self.make_plan()["slots"][0],
+            client,
+            datetime(2026, 7, 14, 9, 0, 2, tzinfo=TZ),
+            clock.now,
+            clock.sleep,
+            on_slot_uncertain=transitions.append,
+        )
+        return result, client, transitions
+
+    def test_ambiguous_create_never_creates_again_when_recovery_misses(self):
+        result, client, transitions = self._uncertain_after_create(
+            "ambiguous"
+        )
+
+        self.assertEqual(client.create_calls, 1)
+        self.assertGreater(client.find_calls, 1)
+        self.assertEqual(result["status"], "uncertain")
+        self.assertEqual(result["room_id"], "omm_703")
+        self.assertIsNone(result["event_id"])
+        self.assertEqual([item["status"] for item in transitions], ["uncertain"])
+
+    def test_network_create_is_also_recovery_only(self):
+        result, client, transitions = self._uncertain_after_create(
+            "transient"
+        )
+
+        self.assertEqual(client.create_calls, 1)
+        self.assertEqual(result["status"], "uncertain")
+        self.assertEqual([item["status"] for item in transitions], ["uncertain"])
+
+    def test_uncertain_restart_only_recovers_without_room_find_or_create(self):
+        plan = self.make_plan()
+        slot = plan["slots"][0]
+        slot.update(
+            status="uncertain",
+            room_id="omm_703",
+            room_name="水滴大厦-7F-703",
+            event_id=None,
+            error="event creation result is uncertain",
+        )
+
+        class RecoveryOnlyClient:
+            def room_find(self, start_iso, end_iso):
+                raise AssertionError("room-find must not run")
+
+            def create_event(self, start_iso, end_iso, room_id):
+                raise AssertionError("create must not run")
+
+            def find_matching_event(self, start_iso, end_iso, room_id):
+                return "evt_restarted"
+
+        fixed_now = datetime(2026, 7, 14, 9, 0, tzinfo=TZ)
+        result = runner.reserve_slot(
+            plan,
+            slot,
+            RecoveryOnlyClient(),
+            datetime(2026, 7, 14, 9, 0, 30, tzinfo=TZ),
+            lambda: fixed_now,
+            lambda seconds: self.fail("unexpected sleep"),
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["event_id"], "evt_restarted")
+
+    def test_recovery_persists_uncertain_then_success_atomically(self):
+        plan = self.make_plan()
+        writes = []
+        room = runner.Room(
+            "omm_703", "水滴大厦-7F-703", "水滴大厦", 7, {}
+        )
+
+        class RecoveringClient:
+            update_notice = False
+
+            def auth_status(self):
+                return None
+
+            def room_find(self, start_iso, end_iso):
+                return [room]
+
+            def create_event(self, start_iso, end_iso, room_id):
+                raise runner.LarkError("timeout", "ambiguous")
+
+            def find_matching_event(self, start_iso, end_iso, room_id):
+                return "evt_recovered"
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            manage._atomic_write_json(manage.plan_path(state_dir), plan)
+            real_write = manage._atomic_write_json
+
+            def recording_write(path, payload):
+                if path == manage.plan_path(state_dir):
+                    writes.append(payload["slots"][0]["status"])
+                real_write(path, payload)
+
+            fixed_now = datetime(2026, 7, 14, 9, 0, tzinfo=TZ)
+            with mock.patch.object(
+                manage, "_atomic_write_json", side_effect=recording_write
+            ):
+                result = runner.execute_due_plan(
+                    state_dir,
+                    fixed_now,
+                    RecoveringClient(),
+                    lambda: fixed_now,
+                    lambda seconds: self.fail("unexpected sleep"),
+                    lambda result: None,
+                )
+
+        self.assertEqual(writes[:2], ["uncertain", "success"])
+        self.assertEqual(result["slots"][0]["event_id"], "evt_recovered")
+
+    def test_lark_create_converts_network_failure_to_ambiguous(self):
+        client = runner.LarkClient(
+            Path("lark-cli"),
+            lambda argv, **kwargs: mock.Mock(
+                returncode=1,
+                stdout="",
+                stderr=json.dumps(
+                    {
+                        "ok": False,
+                        "identity": "user",
+                        "error": {
+                            "type": "network",
+                            "message": "socket reset",
+                        },
+                    }
+                ),
+            ),
+        )
+
+        with self.assertRaises(runner.LarkError) as caught:
+            client.create_event(
+                "2026-07-16T10:00:00+08:00",
+                "2026-07-16T11:00:00+08:00",
+                "omm_703",
+            )
+
+        self.assertEqual(caught.exception.kind, "ambiguous")
+
+
+class PlanValidationSecurityTests(unittest.TestCase):
+    def make_plan(self):
+        return {
+            "schema_version": 1,
+            "plan_id": PLAN_ID,
+            "execution_date": "2026-07-14",
+            "target_date": "2026-07-16",
+            "status": "pending",
+            "slots": [
+                {
+                    "slot_id": "slot-1",
+                    "start": "10:00",
+                    "end": "11:00",
+                    "status": "pending",
+                    "room_id": None,
+                    "room_name": None,
+                    "event_id": None,
+                    "error": None,
                 },
                 {
                     "slot_id": "slot-2",
                     "start": "15:00",
                     "end": "16:00",
                     "status": "pending",
+                    "room_id": None,
+                    "room_name": None,
+                    "event_id": None,
+                    "error": None,
+                },
+            ],
+        }
+
+    def clone(self, plan):
+        return json.loads(json.dumps(plan))
+
+    def test_rejects_invalid_top_level_and_slot_state_combinations(self):
+        invalid_plans = {}
+
+        canceled = self.make_plan()
+        canceled["status"] = "canceled"
+        invalid_plans["canceled"] = canceled
+
+        missing_key = self.make_plan()
+        missing_key.pop("target_date")
+        invalid_plans["missing target"] = missing_key
+
+        unsafe_plan_id = self.make_plan()
+        unsafe_plan_id["plan_id"] = "../../escape"
+        invalid_plans["unsafe plan id"] = unsafe_plan_id
+
+        unsafe_slot_id = self.make_plan()
+        unsafe_slot_id["slots"][0]["slot_id"] = "../../slot"
+        invalid_plans["unsafe slot id"] = unsafe_slot_id
+
+        unknown_slot = self.make_plan()
+        unknown_slot["slots"][0]["status"] = "failed"
+        invalid_plans["unknown slot status"] = unknown_slot
+
+        incomplete_success = self.make_plan()
+        incomplete_success["slots"][0]["status"] = "success"
+        invalid_plans["success without identifiers"] = incomplete_success
+
+        incomplete_uncertain = self.make_plan()
+        incomplete_uncertain["slots"][0].update(
+            status="uncertain",
+            room_id="omm_703",
+            room_name="水滴大厦-7F-703",
+            event_id="evt_forbidden",
+        )
+        invalid_plans["uncertain with event"] = incomplete_uncertain
+
+        for case, plan in invalid_plans.items():
+            with self.subTest(case=case):
+                with self.assertRaisesRegex(runner.LarkError, "invalid plan"):
+                    runner.validate_plan_for_execution(plan)
+
+    def test_accepts_well_formed_success_and_uncertain_slots(self):
+        plan = self.make_plan()
+        plan["slots"][0].update(
+            status="success",
+            room_id="omm_703",
+            room_name="水滴大厦-7F-703",
+            event_id="evt_success",
+        )
+        plan["slots"][1].update(
+            status="uncertain",
+            room_id="omm_705",
+            room_name="水滴大厦-7F-705",
+            event_id=None,
+        )
+
+        self.assertIsNone(runner.validate_plan_for_execution(plan))
+
+    def test_invalid_plan_is_rejected_before_external_calls_or_writes(self):
+        plan = self.make_plan()
+        plan["plan_id"] = "../../escape"
+
+        class NoExternalClient:
+            def __init__(self):
+                self.auth_calls = 0
+
+            def auth_status(self):
+                self.auth_calls += 1
+
+        client = NoExternalClient()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            manage._atomic_write_json(manage.plan_path(state_dir), plan)
+
+            with self.assertRaisesRegex(runner.LarkError, "invalid plan"):
+                runner.execute_due_plan(
+                    state_dir,
+                    datetime(2026, 7, 14, 9, 0, tzinfo=TZ),
+                    client,
+                    lambda: datetime(2026, 7, 14, 9, 0, tzinfo=TZ),
+                    lambda seconds: None,
+                    lambda result: None,
+                )
+
+            self.assertEqual(client.auth_calls, 0)
+            self.assertTrue(manage.plan_path(state_dir).exists())
+            self.assertFalse((root / "escape.json").exists())
+
+    def test_reserve_validates_plan_before_room_lookup(self):
+        plan = self.make_plan()
+        plan["status"] = "canceled"
+
+        class NoLookupClient:
+            def room_find(self, start_iso, end_iso):
+                raise AssertionError("room lookup must not run")
+
+        with self.assertRaisesRegex(runner.LarkError, "invalid plan"):
+            runner.reserve_slot(
+                plan,
+                plan["slots"][0],
+                NoLookupClient(),
+                datetime(2026, 7, 14, 9, 0, 30, tzinfo=TZ),
+                lambda: datetime(2026, 7, 14, 9, 0, tzinfo=TZ),
+                lambda seconds: None,
+            )
+
+    def test_history_path_rejects_symlink_escape(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            outside = root / "outside"
+            outside.mkdir()
+            state_dir.mkdir()
+            (state_dir / "history").symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(runner.LarkError, "history path"):
+                runner._history_path(state_dir, PLAN_ID)
+
+
+class ExecutionConcurrencyTests(unittest.TestCase):
+    def make_plan(self):
+        return {
+            "schema_version": 1,
+            "plan_id": PLAN_ID,
+            "execution_date": "2026-07-14",
+            "target_date": "2026-07-16",
+            "status": "pending",
+            "slots": [
+                {
+                    "slot_id": "slot-1",
+                    "start": "10:00",
+                    "end": "11:00",
+                    "status": "pending",
+                    "room_id": None,
+                    "room_name": None,
+                    "event_id": None,
+                    "error": None,
+                },
+                {
+                    "slot_id": "slot-2",
+                    "start": "15:00",
+                    "end": "16:00",
+                    "status": "pending",
+                    "room_id": None,
+                    "room_name": None,
+                    "event_id": None,
+                    "error": None,
                 },
             ],
         }
@@ -903,6 +1282,7 @@ class ExecutionConcurrencyTests(unittest.TestCase):
             status="success",
             event_id="evt_existing",
             room_id="omm_existing",
+            room_name="水滴大厦-7F-703",
         )
         calls = []
 
@@ -959,7 +1339,11 @@ class LogSafetyTests(unittest.TestCase):
                 "appSecret": "app-secret",
                 "message": (
                     "Bearer abc.def.ghi device_code=device-secret "
-                    "verification_url=https://auth.example/verify?code=url-secret"
+                    "verification_url=https://auth.example/verify?code=url-secret "
+                    "device code space-code-value "
+                    "verification-uri-complete: https://verify.example/"
+                    "start?code=variant-secret "
+                    "open https://accounts.example/oauth/authorize?code=naked-secret"
                 ),
                 "event_id": "evt_safe",
             }
@@ -972,6 +1356,9 @@ class LogSafetyTests(unittest.TestCase):
             "abc.def.ghi",
             "device-secret",
             "url-secret",
+            "space-code-value",
+            "variant-secret",
+            "naked-secret",
         ):
             self.assertNotIn(secret, rendered)
         self.assertIn("evt_safe", rendered)
@@ -1021,6 +1408,43 @@ class LogSafetyTests(unittest.TestCase):
             self.assertTrue(link.is_symlink())
             self.assertTrue(target.exists())
 
+    def test_append_rejects_symlinked_log_directory_before_chmod(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "real-logs"
+            target.mkdir(mode=0o755)
+            link = root / "logs"
+            link.symlink_to(target, target_is_directory=True)
+            before_mode = stat.S_IMODE(target.stat().st_mode)
+
+            with self.assertRaises(OSError):
+                runner.append_log(
+                    link,
+                    datetime(2026, 7, 14, 9, 1, tzinfo=TZ),
+                    {"status": "safe"},
+                )
+
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), before_mode)
+            self.assertEqual(list(target.iterdir()), [])
+
+    def test_cleanup_rejects_symlinked_log_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "real-logs"
+            target.mkdir()
+            old = target / "old.jsonl"
+            old.write_text("safe")
+            now = datetime(2026, 7, 14, 9, 1, tzinfo=TZ)
+            old_time = (now - timedelta(days=31)).timestamp()
+            os.utime(old, (old_time, old_time))
+            link = root / "logs"
+            link.symlink_to(target, target_is_directory=True)
+
+            with self.assertRaises(OSError):
+                runner.cleanup_logs(link, now)
+
+            self.assertTrue(old.exists())
+
 
 class ExecutionPersistenceTests(unittest.TestCase):
     def setUp(self):
@@ -1029,7 +1453,7 @@ class ExecutionPersistenceTests(unittest.TestCase):
         self.now = datetime(2026, 7, 14, 9, 0, tzinfo=TZ)
         self.plan = {
             "schema_version": 1,
-            "plan_id": "plan-persist",
+            "plan_id": PERSIST_PLAN_ID,
             "execution_date": "2026-07-14",
             "target_date": "2026-07-16",
             "status": "pending",
@@ -1039,12 +1463,20 @@ class ExecutionPersistenceTests(unittest.TestCase):
                     "start": "10:00",
                     "end": "11:00",
                     "status": "pending",
+                    "room_id": None,
+                    "room_name": None,
+                    "event_id": None,
+                    "error": None,
                 },
                 {
                     "slot_id": "slot-2",
                     "start": "15:00",
                     "end": "16:00",
                     "status": "pending",
+                    "room_id": None,
+                    "room_name": None,
+                    "event_id": None,
+                    "error": None,
                 },
             ],
         }
@@ -1086,7 +1518,7 @@ class ExecutionPersistenceTests(unittest.TestCase):
         def notifier(result):
             notifications.append(result["status"])
             self.assertFalse(manage.plan_path(self.state_dir).exists())
-            history = self.state_dir / "history" / "plan-persist.json"
+            history = self.state_dir / "history" / f"{PERSIST_PLAN_ID}.json"
             self.assertEqual(json.loads(history.read_text())["status"], "success")
 
         result = runner.execute_due_plan(
@@ -1197,6 +1629,20 @@ class NotificationUpdateTests(unittest.TestCase):
         self.assertIn("一个时间段预订成功", argv[2])
         self.assertEqual(kwargs, {"text": True, "capture_output": True})
 
+    def test_nonzero_booking_notification_is_a_safe_failure(self):
+        with self.assertRaises(runner.LarkError) as caught:
+            runner.notify_result(
+                {"status": "success"},
+                lambda argv, **kwargs: mock.Mock(
+                    returncode=1,
+                    stdout="",
+                    stderr="secret=notification-secret",
+                ),
+            )
+
+        self.assertEqual(caught.exception.kind, "fatal")
+        self.assertNotIn("notification-secret", str(caught.exception))
+
     def test_deferred_update_reports_version_and_skill_status(self):
         client = FakeClient([], [])
         client.update_notice = True
@@ -1245,6 +1691,58 @@ class NotificationUpdateTests(unittest.TestCase):
         self.assertEqual(result["status"], "needs_approval")
         self.assertNotIn("raw-secret", json.dumps(result))
         self.assertEqual([call[-1] for call in calls], ["update"])
+
+    def test_failed_or_timed_out_version_check_never_reports_updated(self):
+        client = FakeClient([], [])
+        client.update_notice = True
+
+        def version_failure(argv, **kwargs):
+            if argv[-1] == "update":
+                return mock.Mock(
+                    returncode=0, stdout="Skills updated\n", stderr=""
+                )
+            return mock.Mock(
+                returncode=1,
+                stdout="",
+                stderr="secret=version-secret",
+            )
+
+        failed = runner.perform_deferred_update(client, version_failure)
+        self.assertEqual(failed["status"], "needs_approval")
+        self.assertNotIn("version-secret", json.dumps(failed))
+
+        def version_timeout(argv, **kwargs):
+            if argv[-1] == "update":
+                return mock.Mock(
+                    returncode=0, stdout="Skills updated\n", stderr=""
+                )
+            raise runner.subprocess.TimeoutExpired(argv, 5)
+
+        timed_out = runner.perform_deferred_update(client, version_timeout)
+        self.assertEqual(timed_out["status"], "needs_approval")
+
+    def test_skills_status_requires_an_explicit_output_pattern(self):
+        client = FakeClient([], [])
+        client.update_notice = True
+        expected = {
+            "Skills updated": True,
+            "Skills already up to date": False,
+            "Skills checked": "unknown",
+        }
+
+        for output, status in expected.items():
+            with self.subTest(output=output):
+                def fake_run(argv, **kwargs):
+                    if argv[-1] == "update":
+                        return mock.Mock(
+                            returncode=0, stdout=output, stderr=""
+                        )
+                    return mock.Mock(
+                        returncode=0, stdout="1.2.3\n", stderr=""
+                    )
+
+                result = runner.perform_deferred_update(client, fake_run)
+                self.assertEqual(result["skills_updated"], status)
 
     def test_update_notification_contains_version_and_skills_state(self):
         calls = []
@@ -1425,6 +1923,279 @@ class RunnerCliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         self.assertFalse(pending_exists)
+
+    def test_notification_failure_prevents_deferred_update(self):
+        update = mock.Mock()
+
+        def archived_then_notify(
+            state_dir, now, client, clock, sleeper, notifier
+        ):
+            notifier({"status": "success", "slots": []})
+            return {"status": "success", "slots": []}
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"LARK_CLI_BIN": "/fake/lark-cli"},
+                    clear=True,
+                ),
+                mock.patch.object(runner, "LarkClient", return_value=object()),
+                mock.patch.object(
+                    runner,
+                    "execute_due_plan",
+                    side_effect=archived_then_notify,
+                ),
+                mock.patch.object(
+                    runner,
+                    "notify_result",
+                    side_effect=runner.LarkError(
+                        "booking notification failed", "fatal"
+                    ),
+                ),
+                mock.patch.object(
+                    runner, "perform_deferred_update", update
+                ),
+                mock.patch.object(runner, "append_log"),
+            ):
+                exit_code = runner.main(["--state-dir", directory])
+
+        self.assertEqual(exit_code, 1)
+        update.assert_not_called()
+
+    def test_pending_update_mutation_uses_state_lock_after_update(self):
+        events = []
+        locked_dirs = []
+        real_locked_state = manage.locked_state
+
+        @contextlib.contextmanager
+        def tracked_lock(state_dir):
+            events.append("lock")
+            locked_dirs.append(state_dir)
+            with real_locked_state(state_dir):
+                yield
+
+        def update_after_booking(client):
+            events.append("update")
+            return {
+                "status": "needs_approval",
+                "error": "interactive approval is required for lark-cli update",
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"LARK_CLI_BIN": "/fake/lark-cli"},
+                    clear=True,
+                ),
+                mock.patch.object(runner, "LarkClient", return_value=object()),
+                mock.patch.object(
+                    runner,
+                    "execute_due_plan",
+                    return_value={"status": "idle"},
+                ),
+                mock.patch.object(
+                    runner,
+                    "perform_deferred_update",
+                    side_effect=update_after_booking,
+                ),
+                mock.patch.object(runner, "notify_update_result"),
+                mock.patch.object(runner, "append_log"),
+                mock.patch.object(
+                    manage, "locked_state", side_effect=tracked_lock
+                ),
+            ):
+                exit_code = runner.main(
+                    ["--state-dir", str(state_dir)]
+                )
+                manage.clear_pending_update(state_dir)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(events[:2], ["update", "lock"])
+        self.assertEqual(locked_dirs, [state_dir, state_dir])
+
+
+class RunnerExceptionBoundaryTests(unittest.TestCase):
+    def make_plan(self):
+        return PlanValidationSecurityTests().make_plan()
+
+    def test_worker_runtime_error_is_reported_without_losing_success(self):
+        barrier = threading.Barrier(2)
+        room = runner.Room(
+            "omm_703", "水滴大厦-7F-703", "水滴大厦", 7, {}
+        )
+
+        class CrashingClient:
+            binary = Path("/fake/lark-cli")
+            update_notice = False
+
+            def auth_status(self):
+                return None
+
+            def room_find(self, start_iso, end_iso):
+                return [room]
+
+            def create_event(self, start_iso, end_iso, room_id):
+                barrier.wait(timeout=1)
+                if "T15:00" in start_iso:
+                    raise RuntimeError("worker secret=must-not-leak")
+                return "evt_durable"
+
+            def find_matching_event(self, start_iso, end_iso, room_id):
+                return None
+
+        reports = []
+        logs = []
+        fixed_now = datetime(2026, 7, 14, 9, 0, tzinfo=TZ)
+        real_execute = runner.execute_due_plan
+
+        def fixed_execute(state_dir, now, client, clock, sleeper, notifier):
+            return real_execute(
+                state_dir,
+                fixed_now,
+                client,
+                lambda: fixed_now,
+                sleeper,
+                notifier,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            manage._atomic_write_json(
+                manage.plan_path(state_dir), self.make_plan()
+            )
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"LARK_CLI_BIN": "/fake/lark-cli"},
+                    clear=True,
+                ),
+                mock.patch.object(
+                    runner, "LarkClient", return_value=CrashingClient()
+                ),
+                mock.patch.object(
+                    runner, "execute_due_plan", side_effect=fixed_execute
+                ),
+                mock.patch.object(
+                    runner,
+                    "notify_result",
+                    side_effect=lambda result: reports.append(result),
+                ),
+                mock.patch.object(
+                    runner,
+                    "append_log",
+                    side_effect=lambda log_dir, now, record: logs.append(record),
+                ),
+                mock.patch.object(
+                    runner, "perform_deferred_update"
+                ) as update,
+            ):
+                exit_code = runner.main(["--state-dir", str(state_dir)])
+
+            pending = manage.load_plan(state_dir)
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(pending["slots"][0]["status"], "success")
+        self.assertEqual(pending["slots"][0]["event_id"], "evt_durable")
+        self.assertEqual(pending["slots"][1]["status"], "pending")
+        self.assertEqual(reports[-1]["error"], "booking runtime failure")
+        self.assertNotIn("must-not-leak", json.dumps([reports, logs]))
+        update.assert_not_called()
+
+    def test_corrupt_json_returns_nonzero_without_escaping(self):
+        reports = []
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            manage.plan_path(state_dir).write_text("{not valid json")
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"LARK_CLI_BIN": "/fake/lark-cli"},
+                    clear=True,
+                ),
+                mock.patch.object(runner, "LarkClient", return_value=object()),
+                mock.patch.object(
+                    runner,
+                    "notify_result",
+                    side_effect=lambda result: reports.append(result),
+                ),
+                mock.patch.object(runner, "append_log"),
+            ):
+                exit_code = runner.main(["--state-dir", str(state_dir)])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(reports[-1]["error"], "booking runtime failure")
+
+    def test_reporting_failures_do_not_escape_final_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"LARK_CLI_BIN": "/fake/lark-cli"},
+                    clear=True,
+                ),
+                mock.patch.object(runner, "LarkClient", return_value=object()),
+                mock.patch.object(
+                    runner,
+                    "execute_due_plan",
+                    side_effect=RuntimeError("worker failure"),
+                ),
+                mock.patch.object(
+                    runner,
+                    "notify_result",
+                    side_effect=OSError("notification failure"),
+                ),
+                mock.patch.object(
+                    runner,
+                    "append_log",
+                    side_effect=OSError("log failure"),
+                ),
+            ):
+                exit_code = runner.main(["--state-dir", directory])
+
+        self.assertEqual(exit_code, 1)
+
+    def test_unexpected_update_exception_does_not_escape(self):
+        notifications = []
+
+        def completed_execution(
+            state_dir, now, client, clock, sleeper, notifier
+        ):
+            result = {"status": "success", "slots": []}
+            notifier(result)
+            return result
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"LARK_CLI_BIN": "/fake/lark-cli"},
+                    clear=True,
+                ),
+                mock.patch.object(runner, "LarkClient", return_value=object()),
+                mock.patch.object(
+                    runner,
+                    "execute_due_plan",
+                    side_effect=completed_execution,
+                ),
+                mock.patch.object(
+                    runner,
+                    "notify_result",
+                    side_effect=lambda result: notifications.append(result),
+                ),
+                mock.patch.object(
+                    runner,
+                    "perform_deferred_update",
+                    side_effect=RuntimeError("update secret"),
+                ),
+                mock.patch.object(runner, "append_log"),
+            ):
+                exit_code = runner.main(["--state-dir", directory])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(notifications[-1]["error"], "booking runtime failure")
 
 
 class RoomRankingTests(unittest.TestCase):
@@ -1754,6 +2525,35 @@ class LarkCommandTests(unittest.TestCase):
 
         def fake_run(argv, **kwargs):
             calls.append(argv)
+            if "+get" in argv:
+                event_id = argv[argv.index("--event-id") + 1]
+                if event_id == "evt_wrong_room":
+                    attendees = [
+                        {"type": "resource", "attendee_id": "omm_999"}
+                    ]
+                    extra = {"location": {"room_id": "omm_704"}}
+                else:
+                    attendees = [
+                        {"type": "resource", "room_id": "omm_704"}
+                    ]
+                    extra = {}
+                return mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps(
+                        {
+                            "ok": True,
+                            "identity": "user",
+                            "data": {
+                                "event": {
+                                    "event_id": event_id,
+                                    "attendees": attendees,
+                                    **extra,
+                                }
+                            },
+                        }
+                    ),
+                    stderr="",
+                )
             return mock.Mock(
                 returncode=0,
                 stdout=json.dumps(
@@ -1766,6 +2566,11 @@ class LarkCommandTests(unittest.TestCase):
                                     "event_id": "evt_wrong_time",
                                     "start": "2026-07-16T09:30:00+08:00",
                                     "end": "2026-07-16T10:30:00+08:00",
+                                },
+                                {
+                                    "event_id": "evt_wrong_room",
+                                    "start": "2026-07-16T10:00:00+08:00",
+                                    "end": "2026-07-16T11:00:00+08:00",
                                 },
                                 {
                                     "event_id": "evt_exact",
@@ -1792,6 +2597,14 @@ class LarkCommandTests(unittest.TestCase):
             calls[0][calls[0].index("--attendee-ids") + 1], "omm_704"
         )
         self.assertEqual(calls[0][calls[0].index("--as") + 1], "user")
+        detail_calls = [call for call in calls if "+get" in call]
+        self.assertEqual(
+            [call[call.index("--event-id") + 1] for call in detail_calls],
+            ["evt_wrong_room", "evt_exact"],
+        )
+        for call in detail_calls:
+            self.assertNotIn("--calendar-id", call)
+            self.assertEqual(call[call.index("--as") + 1], "user")
 
 
 if __name__ == "__main__":
